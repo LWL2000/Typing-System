@@ -1,5 +1,6 @@
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,11 +11,26 @@ from pure_gaze_typing.calibration import (
     CalibrationMetadata,
     StoredCalibration,
 )
-from pure_gaze_typing.eyetrax_runtime import CenterDriftCorrector, EyeTraxRuntime
+from pure_gaze_typing.eyetrax_runtime import (
+    CenterDriftCorrector,
+    EyeTraxRuntime,
+    FrameObservation,
+)
+
+
+class IdentityScaler:
+    def transform(self, values):
+        return np.asarray(values, dtype=float)
 
 
 class FakeEstimator:
-    def __init__(self, features=None, blink=False, prediction=(50.0, 60.0)):
+    def __init__(
+        self,
+        features=None,
+        blink=False,
+        prediction=(50.0, 60.0),
+        scaler=None,
+    ):
         self.features = features
         self.blink = blink
         self.prediction = prediction
@@ -22,6 +38,7 @@ class FakeEstimator:
         self.trained = None
         self.loaded_path = None
         self.closed = False
+        self.model = SimpleNamespace(scaler=scaler)
 
     def extract_features(self, _frame):
         return self.features, self.blink
@@ -58,6 +75,24 @@ def make_metadata() -> CalibrationMetadata:
     )
 
 
+def make_reference_metadata(
+    *,
+    threshold: float = 4.0,
+    affine=((1.0, 0.0), (0.0, 1.0), (0.0, 0.0)),
+) -> CalibrationMetadata:
+    return CalibrationMetadata(
+        "cal-reference",
+        "2026-08-11T12:00:00+08:00",
+        CalibrationEnvironment(1920, 1080, 1.0, 0, "gaze-grid-v3-reference"),
+        (0.0, 0.0),
+        (2.0, 2.0),
+        calibration_mode="precise",
+        pipeline_version="reference-v1",
+        feature_range_threshold=threshold,
+        screen_affine=affine,
+    )
+
+
 def test_blink_frame_is_invalid_and_never_predicted():
     estimator = FakeEstimator(features=np.array([1.0, 2.0]), blink=True)
     runtime = EyeTraxRuntime(
@@ -89,7 +124,7 @@ def test_in_range_prediction_is_smoothed_and_clamped():
     assert (estimate.screen_x, estimate.screen_y) == (1919.0, 0.0)
 
 
-def test_extreme_offscreen_prediction_is_rejected():
+def test_extreme_offscreen_prediction_is_clamped_after_smoothing():
     estimator = FakeEstimator(features=np.array([1.0, 1.0]), prediction=(-500.0, 500.0))
     runtime = EyeTraxRuntime(
         Path("face.task"),
@@ -102,11 +137,11 @@ def test_extreme_offscreen_prediction_is_rejected():
 
     estimate = runtime.process_frame(np.zeros((2, 2, 3), dtype=np.uint8))
 
-    assert not estimate.valid
-    assert estimate.face_detected
+    assert estimate.valid
+    assert (estimate.screen_x, estimate.screen_y) == (0.0, 500.0)
 
 
-def test_default_runtime_uses_strong_ema_smoothing():
+def test_default_runtime_matches_reference_ema_smoothing():
     estimator = FakeEstimator(features=np.array([1.0, 1.0]))
     runtime = EyeTraxRuntime(
         Path("face.task"),
@@ -115,7 +150,87 @@ def test_default_runtime_uses_strong_ema_smoothing():
         estimator_factory=lambda **_kwargs: estimator,
     )
 
-    assert runtime._smoother.ema_alpha == pytest.approx(0.9)
+    assert runtime._smoother.ema_alpha == pytest.approx(0.35)
+
+
+def test_reference_affine_is_applied_before_smoothing():
+    estimator = FakeEstimator(
+        features=np.array([1.0, 1.0]),
+        prediction=(100.0, 200.0),
+        scaler=IdentityScaler(),
+    )
+
+    class RecordingSmoother:
+        def __init__(self):
+            self.input = None
+
+        def step(self, x, y):
+            self.input = (x, y)
+            return x, y
+
+    smoother = RecordingSmoother()
+    runtime = EyeTraxRuntime(
+        Path("face.task"),
+        1920,
+        1080,
+        estimator_factory=lambda **_kwargs: estimator,
+        smoother_factory=lambda: smoother,
+    )
+    runtime.set_metadata(
+        make_reference_metadata(
+            affine=((2.0, 0.0), (0.0, 0.5), (10.0, -20.0)),
+        )
+    )
+
+    estimate = runtime.estimate(FrameObservation(estimator.features, True, False), timestamp=1.0)
+
+    assert smoother.input == (210, 80)
+    assert (estimate.raw_x, estimate.raw_y) == (100.0, 200.0)
+    assert (estimate.screen_x, estimate.screen_y) == (210.0, 80.0)
+
+
+def test_reference_feature_range_softens_quality_then_hard_rejects():
+    estimator = FakeEstimator(prediction=(100.0, 200.0), scaler=IdentityScaler())
+    runtime = EyeTraxRuntime(
+        Path("face.task"),
+        1920,
+        1080,
+        estimator_factory=lambda **_kwargs: estimator,
+        smoother_factory=IdentitySmoother,
+    )
+    runtime.set_metadata(make_reference_metadata(threshold=4.0))
+
+    soft = runtime.estimate(FrameObservation(np.array([6.0, 6.0]), True, False), timestamp=1.0)
+    hard = runtime.estimate(FrameObservation(np.array([9.0, 9.0]), True, False), timestamp=2.0)
+
+    assert soft.valid
+    assert soft.quality == pytest.approx(0.5)
+    assert not hard.valid
+    assert hard.quality == 0.0
+
+
+def test_smoother_resets_after_reference_invalid_interval():
+    estimator = FakeEstimator(prediction=(100.0, 200.0), scaler=IdentityScaler())
+    created = []
+
+    class NumberedSmoother(IdentitySmoother):
+        def __init__(self):
+            created.append(self)
+
+    runtime = EyeTraxRuntime(
+        Path("face.task"),
+        1920,
+        1080,
+        estimator_factory=lambda **_kwargs: estimator,
+        smoother_factory=NumberedSmoother,
+    )
+    runtime.set_metadata(make_reference_metadata())
+    runtime.estimate(FrameObservation(np.array([1.0, 1.0]), True, False), timestamp=1.0)
+    runtime.estimate(FrameObservation(None, False, False), timestamp=1.1)
+    runtime.estimate(FrameObservation(None, False, False), timestamp=2.0)
+    runtime.estimate(FrameObservation(np.array([1.0, 1.0]), True, False), timestamp=2.1)
+
+    assert len(created) == 2
 
 
 def test_low_quality_feature_is_rejected():

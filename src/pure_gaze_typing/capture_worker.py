@@ -77,7 +77,7 @@ class CameraWorker(QObject):
         self._previous_frame_at = now
         try:
             observation = self.runtime.extract(frame)
-            estimate = self.runtime.estimate(observation)
+            estimate = self.runtime.estimate(observation, timestamp=now)
         except Exception as error:
             self.failed.emit(f"眼动处理失败：{error}")
             return

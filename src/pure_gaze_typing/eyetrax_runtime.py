@@ -4,11 +4,16 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import sys
+import time
 from typing import Callable
 
 import numpy as np
 
-from .calibration import CalibrationMetadata, StoredCalibration
+from .calibration import (
+    CalibrationMetadata,
+    StoredCalibration,
+    apply_screen_affine,
+)
 
 
 LOGGER = logging.getLogger("pure_gaze_typing.capture")
@@ -100,9 +105,9 @@ class EyeTraxRuntime:
             LOGGER.info("eyetrax_import_gaze_complete")
         if smoother_factory is None:
             LOGGER.info("eyetrax_import_smoother_begin")
-            from eyetrax.filters import KalmanEMASmoother
+            from eyetrax.filters import KalmanEMASmoother, make_kalman
 
-            smoother_factory = lambda: KalmanEMASmoother(ema_alpha=0.9)
+            smoother_factory = lambda: KalmanEMASmoother(make_kalman(), ema_alpha=0.35)
             LOGGER.info("eyetrax_import_smoother_complete")
         LOGGER.info("eyetrax_estimator_create_begin model=%s", face_model_path)
         if estimator_factory is None:
@@ -120,6 +125,8 @@ class EyeTraxRuntime:
         self.screen_height = int(screen_height)
         self.min_quality = float(min_quality)
         self.metadata: CalibrationMetadata | None = None
+        self._invalid_since: float | None = None
+        self._reset_smoother_on_valid = False
 
     @property
     def estimator(self) -> object:
@@ -135,34 +142,49 @@ class EyeTraxRuntime:
 
     def set_metadata(self, metadata: CalibrationMetadata) -> None:
         self.metadata = metadata
+        model = getattr(self._estimator, "model", None)
+        if model is not None:
+            model.calibration_kind = metadata.pipeline_version
+            model.feature_range_threshold = metadata.feature_range_threshold
+            model.screen_affine = (
+                None if not metadata.screen_affine else np.asarray(metadata.screen_affine, dtype=float)
+            )
 
-    def estimate(self, observation: FrameObservation) -> GazeEstimate:
+    def estimate(
+        self,
+        observation: FrameObservation,
+        *,
+        timestamp: float | None = None,
+    ) -> GazeEstimate:
+        now = time.monotonic() if timestamp is None else float(timestamp)
         if not observation.face_detected or observation.features is None:
+            self._mark_invalid(now)
             return GazeEstimate(False, False, False, 0.0)
         if observation.blink:
+            self._mark_invalid(now)
             return GazeEstimate(False, True, True, 0.0)
         if self.metadata is None:
             return GazeEstimate(False, True, False, 0.0)
-        quality = self._quality(observation.features)
-        if quality < self.min_quality:
+
+        self._mark_valid()
+        quality, hard_reject = self._quality_and_range(observation.features)
+        if hard_reject:
             return GazeEstimate(False, True, False, quality)
         prediction = np.asarray(
             self._estimator.predict(observation.features.reshape(1, -1)),
             dtype=float,
         ).reshape(-1, 2)[0]
         raw_x, raw_y = map(float, prediction)
-        margin_x = self.screen_width * 0.1
-        margin_y = self.screen_height * 0.1
-        if (
-            not np.isfinite(raw_x)
-            or not np.isfinite(raw_y)
-            or raw_x < -margin_x
-            or raw_x > self.screen_width - 1 + margin_x
-            or raw_y < -margin_y
-            or raw_y > self.screen_height - 1 + margin_y
-        ):
+        if not np.isfinite(raw_x) or not np.isfinite(raw_y):
             return GazeEstimate(False, True, False, quality)
-        smooth_x, smooth_y = self._smoother.step(round(raw_x), round(raw_y))
+        corrected_x, corrected_y = raw_x, raw_y
+        if self.metadata.screen_affine:
+            corrected_x, corrected_y = apply_screen_affine(
+                self.metadata.screen_affine,
+                raw_x,
+                raw_y,
+            )
+        smooth_x, smooth_y = self._smoother.step(round(corrected_x), round(corrected_y))
         screen_x = min(max(float(smooth_x), 0.0), float(self.screen_width - 1))
         screen_y = min(max(float(smooth_y), 0.0), float(self.screen_height - 1))
         return GazeEstimate(
@@ -176,17 +198,34 @@ class EyeTraxRuntime:
             screen_y,
         )
 
-    def process_frame(self, frame: np.ndarray) -> GazeEstimate:
-        return self.estimate(self.extract(frame))
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        *,
+        timestamp: float | None = None,
+    ) -> GazeEstimate:
+        return self.estimate(self.extract(frame), timestamp=timestamp)
 
     def train(self, features: np.ndarray, labels: np.ndarray) -> None:
         self._estimator.train(np.asarray(features, dtype=float), np.asarray(labels, dtype=float))
-        self._smoother = self._smoother_factory()
+        self._reset_smoothing()
 
     def load_calibration(self, stored: StoredCalibration) -> None:
         self._estimator.load_model(stored.model_path)
-        self.metadata = stored.metadata
-        self._smoother = self._smoother_factory()
+        self.set_metadata(stored.metadata)
+        self._reset_smoothing()
+
+    def predict_raw(self, features: np.ndarray) -> np.ndarray:
+        return np.asarray(self._estimator.predict(np.asarray(features, dtype=float)), dtype=float)
+
+    def feature_range_threshold(self, training_features: np.ndarray) -> float:
+        model = getattr(self._estimator, "model", None)
+        scaler = getattr(model, "scaler", None)
+        if scaler is None:
+            raise RuntimeError("trained gaze model does not expose a feature scaler")
+        scaled = scaler.transform(np.asarray(training_features, dtype=float))
+        per_sample = np.percentile(np.abs(scaled), 95, axis=1)
+        return max(4.0, float(np.percentile(per_sample, 99)) * 1.5)
 
     def save_model(self, path: Path) -> None:
         self._estimator.save_model(path)
@@ -194,18 +233,49 @@ class EyeTraxRuntime:
     def close(self) -> None:
         self._estimator.close()
 
-    def _quality(self, features: np.ndarray) -> float:
+    def _quality_and_range(self, features: np.ndarray) -> tuple[float, bool]:
         assert self.metadata is not None
+        threshold = self.metadata.feature_range_threshold
+        model = getattr(self._estimator, "model", None)
+        scaler = getattr(model, "scaler", None)
+        if threshold is not None and scaler is not None:
+            scaled = scaler.transform(np.asarray(features, dtype=float).reshape(1, -1))[0]
+            score = float(np.percentile(np.abs(scaled), 95))
+            if score > threshold * 2.0:
+                return 0.0, True
+            if score <= threshold:
+                return 1.0, False
+            quality = max(0.0, 1.0 - (score - threshold) / max(threshold, 1e-6))
+            return float(quality), False
+
         lower = np.asarray(self.metadata.feature_min, dtype=float)
         upper = np.asarray(self.metadata.feature_max, dtype=float)
         vector = np.asarray(features, dtype=float).reshape(-1)
         if vector.size != lower.size or lower.size != upper.size or not np.all(np.isfinite(vector)):
-            return 0.0
+            return 0.0, True
         span = np.maximum(upper - lower, 1e-6)
         below = np.maximum(lower - vector, 0.0) / span
         above = np.maximum(vector - upper, 0.0) / span
         excess = float(np.max(np.maximum(below, above), initial=0.0))
-        return max(0.0, min(1.0, 1.0 - excess))
+        quality = max(0.0, min(1.0, 1.0 - excess))
+        return quality, quality < self.min_quality
+
+    def _mark_invalid(self, timestamp: float) -> None:
+        if self._invalid_since is None:
+            self._invalid_since = timestamp
+        elif timestamp - self._invalid_since >= 0.8:
+            self._reset_smoother_on_valid = True
+
+    def _mark_valid(self) -> None:
+        if self._reset_smoother_on_valid:
+            self._reset_smoothing()
+        self._invalid_since = None
+        self._reset_smoother_on_valid = False
+
+    def _reset_smoothing(self) -> None:
+        self._smoother = self._smoother_factory()
+        self._invalid_since = None
+        self._reset_smoother_on_valid = False
 
 
 class CenterDriftCorrector:
