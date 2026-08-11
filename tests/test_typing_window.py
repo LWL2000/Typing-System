@@ -71,6 +71,24 @@ def make_controller(root: Path, show_gaze_point: bool) -> TypingController:
     return controller
 
 
+def test_compatible_heartbeat_marks_capture_online_without_valid_gaze(tmp_path: Path):
+    controller = TypingController(
+        AppPaths.for_root(tmp_path),
+        TypingSettings(),
+        1920,
+        1080,
+        receiver=FakeReceiver(),
+    )
+
+    controller.process_message(
+        Heartbeat(0.0, True, True, "cal-1", "gaze-grid-v1", 30.0),
+        0.0,
+    )
+
+    assert controller.status.online
+    assert controller.status.calibration_compatible
+
+
 def test_hidden_gaze_point_does_not_change_selection(tmp_path: Path):
     visible = make_controller(tmp_path / "visible", True)
     hidden = make_controller(tmp_path / "hidden", False)
@@ -91,6 +109,26 @@ def test_start_button_requires_online_compatible_calibration(qtbot, tmp_path: Pa
     assert window.start_button.isEnabled()
     assert window.gaze_checkbox.isChecked()
     assert window.dwell_spin.value() == 1.0
+
+
+def test_startup_window_polls_for_udp_before_session_starts(qtbot, tmp_path: Path):
+    class PollingController(FakeTypingController):
+        def __init__(self):
+            super().__init__()
+            self.tick_count = 0
+
+        def tick(self, _now):
+            self.tick_count += 1
+            self.status_changed.emit(ConnectionStatus(True, True, "connected"))
+
+    controller = PollingController()
+    window = StartupWindow(controller, TypingSettings(), AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+
+    qtbot.waitUntil(lambda: controller.tick_count > 0, timeout=300)
+
+    assert window.start_button.isEnabled()
 
 
 def test_typing_window_hides_only_the_gaze_dot(qtbot, tmp_path: Path):

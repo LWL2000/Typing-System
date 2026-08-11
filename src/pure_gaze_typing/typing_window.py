@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCloseEvent, QFont, QPainter, QPen
+from PyQt6.QtGui import QColor, QCloseEvent, QFont, QPainter, QPen, QShowEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -76,6 +76,11 @@ class StartupWindow(QMainWindow):
         self.start_button.clicked.connect(self._start)
         self.exit_button.clicked.connect(self.close)
         controller.status_changed.connect(self._on_status)
+        self._connection_timer = QTimer(self)
+        self._connection_timer.setInterval(33)
+        self._connection_timer.timeout.connect(
+            lambda: controller.tick(time.monotonic())
+        )
         self._on_status(controller.status if hasattr(controller, "status") else ConnectionStatus(False, False, "等待眼动采集程序"))
 
     def _on_status(self, status: ConnectionStatus) -> None:
@@ -83,6 +88,7 @@ class StartupWindow(QMainWindow):
         self.start_button.setEnabled(status.online and status.calibration_compatible)
 
     def _start(self) -> None:
+        self._connection_timer.stop()
         settings = TypingSettings(
             self.gaze_checkbox.isChecked(),
             self.dwell_spin.value(),
@@ -91,6 +97,14 @@ class StartupWindow(QMainWindow):
         save_settings(self.paths.settings_file, settings)
         self.controller.update_settings(settings)
         self.start_requested.emit(settings)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        self._connection_timer.start()
+        super().showEvent(event)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._connection_timer.stop()
+        super().closeEvent(event)
 
 
 class KeyboardCanvas(QWidget):

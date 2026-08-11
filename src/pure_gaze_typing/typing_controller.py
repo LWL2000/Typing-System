@@ -62,7 +62,6 @@ class TypingController(QObject):
         self.recorder: SessionRecorder | None = None
         self._status = ConnectionStatus(False, False, "等待眼动采集程序")
         self._expected_calibration_id = ""
-        self._valid_streak = 0
         self._last_message_at: float | None = None
         self._last_gaze_point: tuple[float, float] | None = None
         self._last_dwell_target: str | None = None
@@ -131,8 +130,8 @@ class TypingController(QObject):
                 self._disconnect("摄像头未就绪")
             elif not compatible:
                 self._set_status(False, False, "校准不可用或界面尺寸不匹配")
-            elif not self._status.online:
-                self._set_status(False, True, "眼动已连接，正在确认有效数据")
+            else:
+                self._set_status(True, True, "眼动采集已连接")
             return self.current_update()
 
         compatible = (
@@ -141,17 +140,9 @@ class TypingController(QObject):
             and message.layout_version == self.layout.version
         )
         if not compatible:
-            self._valid_streak = 0
             self._set_status(False, False, "眼动校准标识不匹配")
             self.dwell.reset()
             return self.current_update()
-
-        if message.valid:
-            self._valid_streak += 1
-            if self._valid_streak >= 5 and not self._status.online:
-                self._set_status(True, True, "眼动已连接")
-        elif not message.blink and not self._status.online:
-            self._valid_streak = 0
 
         blink_update = self.blinks.update(
             current,
@@ -297,7 +288,6 @@ class TypingController(QObject):
             self.recorder.record_event(name, payload)
 
     def _disconnect(self, message: str) -> None:
-        self._valid_streak = 0
         self.dwell.reset()
         self.blinks.reset()
         self._last_dwell_target = None

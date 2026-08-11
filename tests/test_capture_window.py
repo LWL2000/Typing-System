@@ -101,6 +101,22 @@ def test_runtime_initialization_failure_is_reported_without_escaping(tmp_path: P
     controller.stop()
 
 
+def test_stop_disables_heartbeat_before_closing_resources(qtbot, tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda camera_index: CalibrationEnvironment(
+            1920, 1080, 1.0, camera_index, "gaze-grid-v1"
+        ),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    assert controller._heartbeat.isActive()
+
+    controller.stop()
+
+    assert not controller._heartbeat.isActive()
+
+
 def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: Path):
     controller = CaptureController(
         AppPaths.for_root(tmp_path),
@@ -112,10 +128,16 @@ def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: 
     )
     events = []
 
+    class FakeRuntime:
+        def close(self):
+            assert events[-1] == ("thread_wait", 5000)
+            events.append("runtime_close")
+
     class FakeWorker:
         stopped = False
 
     worker = FakeWorker()
+    runtime = FakeRuntime()
 
     class FakeThread:
         def isRunning(self):
@@ -141,8 +163,9 @@ def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: 
     monkeypatch.setattr(capture_module, "QMetaObject", FakeMetaObject, raising=False)
     controller.worker = worker
     controller.thread = FakeThread()
+    controller.runtime = runtime
 
     controller.stop_camera()
 
     assert events[0][0] == "worker_stop"
-    assert events[1:] == ["thread_quit", ("thread_wait", 5000)]
+    assert events[1:] == ["thread_quit", ("thread_wait", 5000), "runtime_close"]

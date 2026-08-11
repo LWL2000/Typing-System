@@ -64,6 +64,7 @@ class CaptureController(QObject):
         self.store = CalibrationStore(paths.calibration_dir)
         self.thread: QThread | None = None
         self.worker: CameraWorker | None = None
+        self.runtime: EyeTraxRuntime | None = None
         self.environment: CalibrationEnvironment | None = None
         self._camera_ready = False
         self._streaming = False
@@ -100,6 +101,7 @@ class CaptureController(QObject):
         if stored is not None:
             runtime.load_calibration(stored)
             LOGGER.info("camera_calibration_loaded id=%s", stored.metadata.calibration_id)
+        self.runtime = runtime
         self.thread = QThread(self)
         self.worker = CameraWorker(camera_index, runtime, self.store)
         self.worker.moveToThread(self.thread)
@@ -109,6 +111,7 @@ class CaptureController(QObject):
         self.worker.packet_ready.connect(self._on_packet)
         self.worker.model_saved.connect(self._on_model_saved)
         self.worker.failed.connect(self._on_worker_failure)
+        self.worker.stopped.connect(self.worker.deleteLater)
         self.worker.stopped.connect(self.thread.quit)
         self._train_requested.connect(self.worker.train_and_save)
         self.thread.start()
@@ -150,7 +153,7 @@ class CaptureController(QObject):
         self.calibration_finished.emit(True, "校准已保存（已跳过未命中区域）", ())
 
     def start_streaming(self) -> None:
-        if self.worker is None or self.worker.runtime.metadata is None:
+        if self.worker is None or self.runtime is None or self.runtime.metadata is None:
             self.stream_state_changed.emit(False, "请先完成校准")
             return
         self._streaming = True
@@ -174,11 +177,16 @@ class CaptureController(QObject):
                 LOGGER.warning("camera_thread_stop_wait_extended")
                 self.thread.wait()
             LOGGER.info("camera_thread_stopped")
+        if self.runtime is not None:
+            self.runtime.close()
+            LOGGER.info("camera_runtime_closed")
         self.worker = None
         self.thread = None
+        self.runtime = None
         self._camera_ready = False
 
     def stop(self) -> None:
+        self._heartbeat.stop()
         self.stop_streaming()
         self.stop_camera()
         self.publisher.close()
@@ -265,9 +273,9 @@ class CaptureController(QObject):
         self.calibration_finished.emit(result.passed, message, result.failed_target_ids)
 
     def _publish_estimate(self, packet: CapturePacket) -> None:
-        assert self.worker is not None and self.worker.runtime.metadata is not None
+        assert self.runtime is not None and self.runtime.metadata is not None
         estimate = packet.estimate
-        metadata = self.worker.runtime.metadata
+        metadata = self.runtime.metadata
         sample = GazeSample(
             timestamp=time.time(),
             valid=estimate.valid,
@@ -285,7 +293,7 @@ class CaptureController(QObject):
         self.publisher.send(sample)
 
     def _publish_heartbeat(self) -> None:
-        metadata = self.worker.runtime.metadata if self.worker is not None else None
+        metadata = self.runtime.metadata if self.runtime is not None else None
         heartbeat = Heartbeat(
             timestamp=time.time(),
             camera_ok=self._camera_ready,

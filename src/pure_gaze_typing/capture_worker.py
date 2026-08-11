@@ -122,6 +122,5 @@ class CameraWorker(QObject):
         if self._capture is not None:
             self._capture.release()
             self._capture = None
-        self.runtime.close()
         LOGGER.info("camera_worker_stopped")
         self.stopped.emit()
