@@ -25,9 +25,11 @@ class FakeCaptureController(QObject):
         self.calibration_calls = []
         self.cancel_calls = 0
         self.stop_calls = 0
+        self.camera_calls = []
+        self.stop_stream_calls = 0
 
-    def start_camera(self, _index):
-        return None
+    def start_camera(self, index):
+        self.camera_calls.append(index)
 
     def start_calibration(self, mode, validate=False):
         self.calibration_calls.append((mode, validate))
@@ -39,7 +41,7 @@ class FakeCaptureController(QObject):
         return None
 
     def stop_streaming(self):
-        return None
+        self.stop_stream_calls += 1
 
     def retry_failed_regions(self):
         return None
@@ -123,6 +125,33 @@ def test_pause_output_has_visible_feedback_even_while_preview_continues(qtbot, t
 
     assert "预览继续" in window.result_label.text()
     assert window.stream_button.text() == "恢复输出"
+
+
+def test_pause_output_responds_on_mouse_press(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+    controller.stream_state_changed.emit(True, "眼动数据正在输出")
+
+    window.stop_stream_button.pressed.emit()
+
+    assert controller.stop_stream_calls == 1
+    assert "正在暂停" in window.result_label.text()
+
+
+def test_reconnect_responds_before_camera_initialization(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+    controller.camera_state_changed.emit(True, "摄像头 0 已连接")
+
+    window.connect_button.pressed.emit()
+
+    assert "正在重新连接" in window.camera_status_label.text()
+    assert not window.connect_button.isEnabled()
+    qtbot.waitUntil(lambda: controller.camera_calls == [0], timeout=300)
 
 
 def test_window_close_stops_controller_and_closes_immediately(qtbot, tmp_path: Path):

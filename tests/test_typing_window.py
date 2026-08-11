@@ -1,6 +1,7 @@
+from dataclasses import replace
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 
 from pure_gaze_typing.layout import LAYOUT_VERSION
 from pure_gaze_typing.paths import AppPaths
@@ -176,6 +177,55 @@ def test_typing_window_hides_only_the_gaze_dot(qtbot, tmp_path: Path):
     controller.update_ready.emit(update)
     assert not window.canvas.show_gaze_point
     assert window.canvas.target_labels
+
+
+def test_send_commits_a_newline_without_finishing_the_session(tmp_path: Path):
+    controller = make_controller(tmp_path, True)
+    controller.start_session(skip_prepare=True)
+    controller.engine.current_line = "HELLO"
+    recorder = controller.recorder
+
+    controller._activate("main_send")
+
+    assert controller.recorder is recorder
+    assert controller.engine.current_line == ""
+    assert controller.engine.full_text() == "HELLO\n"
+    assert not recorder.result_path.exists()
+    controller.end_session()
+    assert recorder.result_path.read_text(encoding="utf-8") == "HELLO\n"
+
+
+def test_typing_window_does_not_close_after_send_signal(qtbot, tmp_path: Path):
+    controller = make_controller(tmp_path, True)
+    controller.start_session(skip_prepare=True)
+    window = TypingWindow(controller, controller.settings)
+    qtbot.addWidget(window)
+    window.show()
+
+    controller.session_finished.emit("HELLO")
+    qtbot.wait(550)
+
+    assert window.isVisible()
+    window.close()
+
+
+def test_history_view_is_read_only_scrollable_and_at_most_three_lines_high(qtbot, tmp_path: Path):
+    controller = make_controller(tmp_path, True)
+    window = TypingWindow(controller, controller.settings)
+    qtbot.addWidget(window)
+    window.resize(1920, 1080)
+    window.show()
+    window._timer.stop()
+    update = replace(controller.current_update(), current_text="ONE\nTWO\nTHREE\nFOUR\nFIVE")
+
+    window.canvas.set_controller_update(update)
+    qtbot.wait(50)
+
+    history = window.canvas.history_view
+    assert history.isReadOnly()
+    assert history.toPlainText() == update.current_text
+    assert history.verticalScrollBar().maximum() == 2
+    assert history.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
 
 
 def test_three_blinks_return_from_letter_page(tmp_path: Path):

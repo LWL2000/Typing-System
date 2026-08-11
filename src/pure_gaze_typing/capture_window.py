@@ -692,12 +692,10 @@ class CaptureWindow(QMainWindow):
         )
         root.addWidget(self.result_label)
 
-        self.connect_button.clicked.connect(
-            lambda: self.controller.start_camera(self.camera_combo.currentIndex())
-        )
+        self.connect_button.pressed.connect(self._request_camera_connection)
         self.calibrate_button.clicked.connect(self._begin_calibration)
-        self.stream_button.clicked.connect(self.controller.start_streaming)
-        self.stop_stream_button.clicked.connect(self.controller.stop_streaming)
+        self.stream_button.pressed.connect(self._request_stream_start)
+        self.stop_stream_button.pressed.connect(self._request_stream_stop)
         self.retry_failed_button.clicked.connect(self.controller.retry_failed_regions)
         self.save_anyway_button.clicked.connect(self.controller.save_anyway)
         controller.camera_state_changed.connect(self._on_camera_state)
@@ -705,6 +703,25 @@ class CaptureWindow(QMainWindow):
         controller.calibration_finished.connect(self._on_calibration_finished)
         controller.stream_state_changed.connect(self._on_stream_state)
         controller.preview_ready.connect(self._on_preview)
+
+    def _request_camera_connection(self) -> None:
+        reconnecting = self.connect_button.text() == "重新连接"
+        action = "重新连接" if reconnecting else "连接"
+        self.camera_status_label.setText(f"正在{action}摄像头…")
+        self.result_label.setText(f"正在{action}摄像头，请稍候")
+        self.connect_button.setEnabled(False)
+        camera_index = self.camera_combo.currentIndex()
+        QTimer.singleShot(50, lambda: self.controller.start_camera(camera_index))
+
+    def _request_stream_start(self) -> None:
+        self.result_label.setText("正在恢复眼动输出…")
+        self.stream_button.setEnabled(False)
+        self.controller.start_streaming()
+
+    def _request_stream_stop(self) -> None:
+        self.result_label.setText("正在暂停眼动输出…")
+        self.stop_stream_button.setEnabled(False)
+        self.controller.stop_streaming()
 
     def _begin_calibration(self) -> None:
         self.result_label.setText("请选择校准方式")
@@ -784,6 +801,7 @@ class CaptureWindow(QMainWindow):
     def _on_camera_state(self, ready: bool, message: str) -> None:
         self.camera_status_label.setText(message)
         self.calibrate_button.setEnabled(ready)
+        self.connect_button.setEnabled(True)
         self.connect_button.setText("重新连接" if ready else "连接摄像头")
 
     def _on_calibration_finished(self, passed: bool, message: str, failed_targets) -> None:

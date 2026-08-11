@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -115,11 +116,49 @@ class KeyboardCanvas(QWidget):
         self.target_labels: tuple[str, ...] = ("",) * 8
         self.update_state: ControllerUpdate | None = None
         self.setMinimumSize(800, 600)
+        self.history_view = QPlainTextEdit(self)
+        self.history_view.setReadOnly(True)
+        self.history_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.history_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.history_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.history_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.history_view.setFont(QFont("Microsoft YaHei", 15))
+        self.history_view.document().setDocumentMargin(0)
+        self.history_view.setStyleSheet(
+            "QPlainTextEdit{background:#000000;color:#f3f3f3;border:2px solid #777777;"
+            "padding:0 8px;}"
+            "QScrollBar:vertical{width:10px;background:#111111;}"
+            "QScrollBar::handle:vertical{background:#888888;min-height:20px;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+        )
+        self._sync_history_geometry()
 
     def set_controller_update(self, update: ControllerUpdate) -> None:
         self.update_state = update
         self.target_labels = update.target_labels
+        if self.history_view.toPlainText() != update.current_text:
+            scroll = self.history_view.verticalScrollBar()
+            was_at_bottom = scroll.value() >= scroll.maximum() - 1
+            self.history_view.setPlainText(update.current_text)
+            if was_at_bottom:
+                scroll.setValue(scroll.maximum())
         self.update()
+
+    def resizeEvent(self, event) -> None:
+        self._sync_history_geometry()
+        super().resizeEvent(event)
+
+    def _sync_history_geometry(self) -> None:
+        layout = build_layout(max(1, self.width()), max(1, self.height()))
+        line_height = self.history_view.fontMetrics().lineSpacing()
+        height = min(round(layout.top_bar.height), line_height * 3 + 12)
+        top = round(layout.top_bar.top + (layout.top_bar.height - height) / 2.0)
+        self.history_view.setGeometry(
+            round(layout.top_bar.left),
+            top,
+            round(layout.top_bar.width),
+            height,
+        )
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -131,26 +170,6 @@ class KeyboardCanvas(QWidget):
         target_rects = layout.targets_for(len(labels))
         current_target = None if update is None else update.dwell_target_id
         progress = 0.0 if update is None else update.dwell_progress
-
-        painter.setPen(QPen(QColor("#777777"), 2))
-        painter.setBrush(QColor("#000000"))
-        painter.drawRect(
-            round(layout.top_bar.left),
-            round(layout.top_bar.top),
-            round(layout.top_bar.width),
-            round(layout.top_bar.height),
-        )
-        painter.setPen(QColor("#f3f3f3"))
-        painter.setFont(QFont("Microsoft YaHei", 15))
-        top_text = "" if update is None else update.current_text
-        painter.drawText(
-            round(layout.top_bar.left + 14),
-            round(layout.top_bar.top),
-            round(layout.top_bar.width - 28),
-            round(layout.top_bar.height),
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            top_text,
-        )
 
         font_size = 24 if len(labels) == 8 else 28
         painter.setFont(QFont("Microsoft YaHei", font_size, QFont.Weight.DemiBold))
@@ -209,14 +228,10 @@ class TypingWindow(QMainWindow):
         self.setCentralWidget(self.canvas)
         self.canvas.set_controller_update(controller.current_update())
         controller.update_ready.connect(self.canvas.set_controller_update)
-        controller.session_finished.connect(self._on_session_finished)
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(lambda: controller.tick(time.monotonic()))
         self._timer.start()
-
-    def _on_session_finished(self, _text: str) -> None:
-        QTimer.singleShot(450, self.close)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._timer.stop()

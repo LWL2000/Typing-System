@@ -53,6 +53,7 @@ def test_send_does_not_clear_until_persistence_is_confirmed():
     engine.confirm_send()
     assert engine.current_line == ""
     assert engine.history == ("HELLO",)
+    assert engine.full_text() == "HELLO\n"
 
 
 def test_return_to_main_keeps_typed_text():

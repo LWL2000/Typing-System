@@ -272,13 +272,9 @@ class TypingController(QObject):
             if self.recorder is None:
                 self._set_message("当前没有实验记录，无法发送")
                 return
-            if self.recorder.finish(effect.sent_text):
-                self.engine.confirm_send()
-                self.recorder = None
-                self._set_message("文本已保存")
-                self.session_finished.emit(effect.sent_text)
-            else:
-                self._set_message("文本保存失败，内容已保留")
+            self._record_event("line_sent", {"text": self.engine.current_line})
+            self.engine.confirm_send()
+            self._set_message("已换行，可继续输入")
 
     def _record_gaze(self, sample: GazeSample, target_id: str | None, progress: float) -> None:
         if self.recorder is not None:

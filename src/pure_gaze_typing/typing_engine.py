@@ -114,7 +114,4 @@ class TypingEngine:
         self._group_index = None
 
     def full_text(self) -> str:
-        lines = [*self._history]
-        if self.current_line or not lines:
-            lines.append(self.current_line)
-        return "\n".join(lines)
+        return "\n".join((*self._history, self.current_line))
