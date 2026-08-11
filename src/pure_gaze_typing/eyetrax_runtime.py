@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import sys
 from typing import Callable
@@ -8,6 +9,51 @@ from typing import Callable
 import numpy as np
 
 from .calibration import CalibrationMetadata, StoredCalibration
+
+
+LOGGER = logging.getLogger("pure_gaze_typing.capture")
+
+
+def _create_face_landmarker_from_buffer(*, model_path):
+    import mediapipe as mp
+    from mediapipe.tasks.python import vision
+    from mediapipe.tasks.python.core.base_options import BaseOptions
+
+    task_path = Path(model_path).expanduser().resolve()
+    model_bytes = task_path.read_bytes()
+    options = vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_buffer=model_bytes),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+    )
+    return mp, vision.FaceLandmarker.create_from_options(options)
+
+
+def _create_default_estimator(face_model_path: Path):
+    from eyetrax import gaze
+    from eyetrax.models.ridge import RidgeModel
+
+    original_landmarker_factory = gaze._create_face_landmarker
+    original_model_factory = gaze.create_model
+    gaze._create_face_landmarker = _create_face_landmarker_from_buffer
+    gaze.create_model = lambda name, **kwargs: (
+        RidgeModel(**kwargs)
+        if name == "ridge"
+        else original_model_factory(name, **kwargs)
+    )
+    try:
+        return gaze.GazeEstimator(
+            model_name="ridge",
+            face_landmarker_model=str(face_model_path),
+        )
+    finally:
+        gaze._create_face_landmarker = original_landmarker_factory
+        gaze.create_model = original_model_factory
 
 
 @dataclass(frozen=True)
@@ -49,19 +95,27 @@ class EyeTraxRuntime:
         min_quality: float = 0.25,
     ) -> None:
         if estimator_factory is None:
-            from eyetrax.gaze import GazeEstimator
-
-            estimator_factory = GazeEstimator
+            LOGGER.info("eyetrax_import_gaze_begin")
+            from eyetrax import gaze as _gaze
+            LOGGER.info("eyetrax_import_gaze_complete")
         if smoother_factory is None:
+            LOGGER.info("eyetrax_import_smoother_begin")
             from eyetrax.filters import KalmanEMASmoother
 
             smoother_factory = KalmanEMASmoother
-        self._estimator = estimator_factory(
-            model_name="ridge",
-            face_landmarker_model=str(face_model_path),
-        )
+            LOGGER.info("eyetrax_import_smoother_complete")
+        LOGGER.info("eyetrax_estimator_create_begin model=%s", face_model_path)
+        if estimator_factory is None:
+            self._estimator = _create_default_estimator(face_model_path)
+        else:
+            self._estimator = estimator_factory(
+                model_name="ridge",
+                face_landmarker_model=str(face_model_path),
+            )
+        LOGGER.info("eyetrax_estimator_create_complete")
         self._smoother_factory = smoother_factory
         self._smoother = smoother_factory()
+        LOGGER.info("eyetrax_smoother_create_complete")
         self.screen_width = int(screen_width)
         self.screen_height = int(screen_height)
         self.min_quality = float(min_quality)

@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from pure_gaze_typing.capture_window import CaptureWindow
+import pure_gaze_typing.capture_window as capture_module
+from pure_gaze_typing.calibration import CalibrationEnvironment
+from pure_gaze_typing.capture_window import CaptureController, CaptureWindow
 from pure_gaze_typing.layout import build_layout
 from pure_gaze_typing.paths import AppPaths
 
@@ -37,6 +39,14 @@ class FakeCaptureController(QObject):
         return None
 
 
+class FakePublisher:
+    def send(self, _message):
+        return None
+
+    def close(self):
+        return None
+
+
 def test_validation_is_off_by_default_and_calibration_button_tracks_camera(qtbot, tmp_path: Path):
     controller = FakeCaptureController()
     window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
@@ -65,3 +75,74 @@ def test_failed_validation_exposes_retry_and_save_actions(qtbot, tmp_path: Path)
     controller.calibration_finished.emit(False, "命中 4/6", ("target_1", "target_4"))
     assert window.retry_failed_button.isVisibleTo(window)
     assert window.save_anyway_button.isVisibleTo(window)
+
+
+def test_runtime_initialization_failure_is_reported_without_escaping(tmp_path: Path):
+    def failing_runtime(*_args, **_kwargs):
+        raise FileNotFoundError("模型无法加载")
+
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda camera_index: CalibrationEnvironment(
+            1920, 1080, 1.0, camera_index, "gaze-grid-v1"
+        ),
+        tmp_path / "face_landmarker.task",
+        runtime_factory=failing_runtime,
+        publisher_factory=FakePublisher,
+    )
+    states = []
+    controller.camera_state_changed.connect(
+        lambda ready, message: states.append((ready, message))
+    )
+
+    controller.start_camera(0)
+
+    assert states == [(False, "眼动运行时初始化失败：模型无法加载")]
+    controller.stop()
+
+
+def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda camera_index: CalibrationEnvironment(
+            1920, 1080, 1.0, camera_index, "gaze-grid-v1"
+        ),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    events = []
+
+    class FakeWorker:
+        stopped = False
+
+    worker = FakeWorker()
+
+    class FakeThread:
+        def isRunning(self):
+            return True
+
+        def quit(self):
+            assert worker.stopped
+            events.append("thread_quit")
+
+        def wait(self, timeout):
+            events.append(("thread_wait", timeout))
+            return True
+
+    class FakeMetaObject:
+        @staticmethod
+        def invokeMethod(target, method, connection):
+            assert target is worker
+            assert method == "stop"
+            worker.stopped = True
+            events.append(("worker_stop", connection))
+            return True
+
+    monkeypatch.setattr(capture_module, "QMetaObject", FakeMetaObject, raising=False)
+    controller.worker = worker
+    controller.thread = FakeThread()
+
+    controller.stop_camera()
+
+    assert events[0][0] == "worker_stop"
+    assert events[1:] == ["thread_quit", ("thread_wait", 5000)]

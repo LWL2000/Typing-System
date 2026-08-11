@@ -1,7 +1,9 @@
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pytest
+import pure_gaze_typing.eyetrax_runtime as runtime_module
 
 from pure_gaze_typing.calibration import (
     CalibrationEnvironment,
@@ -126,3 +128,41 @@ def test_center_drift_is_median_based_and_capped():
     offset = corrector.finish((960.0, 540.0))
     assert offset == pytest.approx((-153.6, -54.0))
     assert corrector.apply(1000.0, 600.0) == pytest.approx((846.4, 546.0))
+
+
+def test_default_runtime_loads_face_model_from_unicode_path(tmp_path: Path):
+    source = Path.home() / ".cache" / "eyetrax" / "mediapipe" / "face_landmarker.task"
+    if not source.is_file():
+        pytest.skip("EyeTrax FaceLandmarker model is not available")
+    model = tmp_path / "中文模型" / "face_landmarker.task"
+    model.parent.mkdir()
+    shutil.copyfile(source, model)
+
+    runtime = EyeTraxRuntime(model, 1920, 1080)
+    runtime.close()
+
+
+def test_default_runtime_does_not_use_eyetrax_model_directory_discovery(
+    monkeypatch, tmp_path: Path
+):
+    from eyetrax import gaze
+
+    class FakeLandmarker:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_create_face_landmarker_from_buffer",
+        lambda **_kwargs: (object(), FakeLandmarker()),
+    )
+    monkeypatch.setattr(
+        gaze,
+        "create_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("eyetrax/models is not a physical directory")
+        ),
+    )
+
+    runtime = EyeTraxRuntime(tmp_path / "face_landmarker.task", 1920, 1080)
+    runtime.close()

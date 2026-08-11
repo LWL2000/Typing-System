@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 import time
 import uuid
 
 import numpy as np
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QMetaObject, QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -34,6 +35,9 @@ from .paths import AppPaths
 from .protocol import GazeSample, Heartbeat, UdpPublisher
 
 
+LOGGER = logging.getLogger("pure_gaze_typing.capture")
+
+
 class CaptureController(QObject):
     camera_state_changed = pyqtSignal(bool, str)
     calibration_point_changed = pyqtSignal(str)
@@ -41,7 +45,6 @@ class CaptureController(QObject):
     stream_state_changed = pyqtSignal(bool, str)
     preview_ready = pyqtSignal(object)
     _train_requested = pyqtSignal(object, object, object)
-    _stop_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -78,16 +81,25 @@ class CaptureController(QObject):
         self._heartbeat.start()
 
     def start_camera(self, camera_index: int) -> None:
+        LOGGER.info("camera_start_requested index=%s", camera_index)
         self.stop_camera()
         self.environment = self.environment_factory(int(camera_index))
-        runtime = self.runtime_factory(
-            self.face_model_path,
-            self.environment.screen_width,
-            self.environment.screen_height,
-        )
+        LOGGER.info("camera_environment_ready environment=%s", self.environment)
+        try:
+            runtime = self.runtime_factory(
+                self.face_model_path,
+                self.environment.screen_width,
+                self.environment.screen_height,
+            )
+        except Exception as error:
+            LOGGER.exception("camera_runtime_initialization_failed")
+            self.camera_state_changed.emit(False, f"眼动运行时初始化失败：{error}")
+            return
+        LOGGER.info("camera_runtime_ready runtime=%s", type(runtime).__name__)
         stored = self.store.load(self.environment)
         if stored is not None:
             runtime.load_calibration(stored)
+            LOGGER.info("camera_calibration_loaded id=%s", stored.metadata.calibration_id)
         self.thread = QThread(self)
         self.worker = CameraWorker(camera_index, runtime, self.store)
         self.worker.moveToThread(self.thread)
@@ -99,8 +111,8 @@ class CaptureController(QObject):
         self.worker.failed.connect(self._on_worker_failure)
         self.worker.stopped.connect(self.thread.quit)
         self._train_requested.connect(self.worker.train_and_save)
-        self._stop_requested.connect(self.worker.stop)
         self.thread.start()
+        LOGGER.info("camera_thread_started")
 
     def start_calibration(self, validate: bool) -> None:
         if not self._camera_ready or self.environment is None:
@@ -150,9 +162,18 @@ class CaptureController(QObject):
 
     def stop_camera(self) -> None:
         if self.worker is not None and self.thread is not None:
-            self._stop_requested.emit()
+            if self.thread.isRunning():
+                LOGGER.info("camera_worker_stop_requested")
+                QMetaObject.invokeMethod(
+                    self.worker,
+                    "stop",
+                    Qt.ConnectionType.BlockingQueuedConnection,
+                )
             self.thread.quit()
-            self.thread.wait(1500)
+            if not self.thread.wait(5000):
+                LOGGER.warning("camera_thread_stop_wait_extended")
+                self.thread.wait()
+            LOGGER.info("camera_thread_stopped")
         self.worker = None
         self.thread = None
         self._camera_ready = False
