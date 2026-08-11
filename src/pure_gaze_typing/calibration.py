@@ -1,13 +1,65 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from enum import Enum
 import json
 import math
 from pathlib import Path
 import shutil
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, Sequence
 
 import numpy as np
+
+
+REFERENCE_PIPELINE_VERSION = "reference-v1"
+
+
+class CalibrationMode(str, Enum):
+    FAST = "fast"
+    PRECISE = "precise"
+
+
+@dataclass(frozen=True)
+class CalibrationProfile:
+    mode: CalibrationMode
+    pose_hold_seconds: float
+    settle_seconds: float
+    capture_seconds: float
+    max_samples_per_point: int
+    target_passes: int
+    reverse_second_pass: bool
+    validation_settle_seconds: float
+    validation_capture_seconds: float
+    estimated_seconds: int
+
+
+def calibration_profile(mode: CalibrationMode | str) -> CalibrationProfile:
+    selected = CalibrationMode(mode)
+    if selected is CalibrationMode.PRECISE:
+        return CalibrationProfile(
+            mode=selected,
+            pose_hold_seconds=1.5,
+            settle_seconds=0.65,
+            capture_seconds=0.90,
+            max_samples_per_point=24,
+            target_passes=2,
+            reverse_second_pass=True,
+            validation_settle_seconds=0.45,
+            validation_capture_seconds=0.60,
+            estimated_seconds=55,
+        )
+    return CalibrationProfile(
+        mode=selected,
+        pose_hold_seconds=0.8,
+        settle_seconds=0.35,
+        capture_seconds=0.55,
+        max_samples_per_point=18,
+        target_passes=1,
+        reverse_second_pass=False,
+        validation_settle_seconds=0.25,
+        validation_capture_seconds=0.45,
+        estimated_seconds=30,
+    )
 
 
 @dataclass(frozen=True)
@@ -32,12 +84,23 @@ class CalibrationMetadata:
     environment: CalibrationEnvironment
     feature_min: tuple[float, ...]
     feature_max: tuple[float, ...]
+    calibration_mode: str = CalibrationMode.FAST.value
+    pipeline_version: str = REFERENCE_PIPELINE_VERSION
+    feature_range_threshold: float | None = None
+    screen_affine: tuple[tuple[float, float], ...] = ()
+    validation_hits: int | None = None
+    validation_total: int | None = None
 
     def __post_init__(self) -> None:
         if not self.calibration_id:
             raise ValueError("calibration_id is required")
         if len(self.feature_min) != len(self.feature_max):
             raise ValueError("feature bounds must have equal lengths")
+        CalibrationMode(self.calibration_mode)
+        if self.feature_range_threshold is not None and self.feature_range_threshold <= 0:
+            raise ValueError("feature range threshold must be positive")
+        if self.screen_affine and (len(self.screen_affine) != 3 or any(len(row) != 2 for row in self.screen_affine)):
+            raise ValueError("screen affine coefficients must be 3x2")
 
 
 @dataclass(frozen=True)
@@ -175,6 +238,87 @@ class CalibrationSession:
         return tuple(map(float, lower)), tuple(map(float, upper))
 
 
+def filter_stable_features(
+    features: Sequence[object] | np.ndarray,
+    *,
+    max_samples: int = 24,
+    min_samples: int = 8,
+) -> np.ndarray:
+    values = np.asarray(features, dtype=float)
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    if values.ndim != 2:
+        raise ValueError("features must be a 2D array")
+    values = values[np.all(np.isfinite(values), axis=1)]
+    if values.shape[0] == 0:
+        return values
+
+    center = np.median(values, axis=0)
+    mad = np.median(np.abs(values - center), axis=0)
+    std_fallback = np.std(values, axis=0) * 0.6745
+    scale = 1.4826 * np.maximum(mad, std_fallback * 0.25)
+    scale = np.maximum(scale, 1e-6)
+    robust_z = np.abs((values - center) / scale)
+    row_score = np.percentile(robust_z, 80, axis=1)
+
+    keep = np.flatnonzero(row_score <= 3.5)
+    wanted_min = min(max(1, int(min_samples)), values.shape[0])
+    if keep.size < wanted_min:
+        keep = np.argsort(row_score)[:wanted_min]
+    keep = np.sort(keep)
+    cap = max(1, int(max_samples))
+    if keep.size > cap:
+        positions = np.linspace(0, keep.size - 1, cap).round().astype(int)
+        keep = keep[positions]
+    return values[keep]
+
+
+def balance_point_samples(
+    groups: Sequence[tuple[tuple[float, float], np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    if not groups:
+        raise ValueError("at least one calibration point group is required")
+    prepared = [(target, np.asarray(features, dtype=float)) for target, features in groups]
+    if any(features.ndim != 2 or features.shape[0] == 0 for _target, features in prepared):
+        raise ValueError("each calibration point requires a non-empty 2D feature array")
+    feature_widths = {features.shape[1] for _target, features in prepared}
+    if len(feature_widths) != 1:
+        raise ValueError("feature widths must match")
+
+    balanced_count = min(features.shape[0] for _target, features in prepared)
+    feature_rows: list[np.ndarray] = []
+    target_rows: list[tuple[float, float]] = []
+    for target, features in prepared:
+        balanced = features[:balanced_count]
+        feature_rows.append(balanced)
+        target_rows.extend((float(target[0]), float(target[1])) for _ in range(balanced_count))
+    return np.vstack(feature_rows), np.asarray(target_rows, dtype=float)
+
+
+def fit_screen_affine(predicted_points: np.ndarray, target_points: np.ndarray) -> np.ndarray:
+    predicted = np.asarray(predicted_points, dtype=float)
+    targets = np.asarray(target_points, dtype=float)
+    if predicted.shape != targets.shape or predicted.ndim != 2 or predicted.shape[1] != 2:
+        raise ValueError("predicted_points and target_points must both be Nx2")
+    design = np.column_stack((predicted, np.ones(predicted.shape[0], dtype=float)))
+    coefficients, _residuals, rank, _singular = np.linalg.lstsq(design, targets, rcond=None)
+    if rank < 3:
+        raise RuntimeError("calibration validation points are degenerate")
+    return coefficients
+
+
+def apply_screen_affine(
+    coefficients: Sequence[Sequence[float]] | np.ndarray,
+    x: float,
+    y: float,
+) -> tuple[float, float]:
+    matrix = np.asarray(coefficients, dtype=float)
+    if matrix.shape != (3, 2):
+        raise ValueError("screen affine coefficients must be 3x2")
+    corrected = np.asarray([float(x), float(y), 1.0]) @ matrix
+    return float(corrected[0]), float(corrected[1])
+
+
 def score_validation(
     hit_counts: Mapping[str, int],
     *,
@@ -262,4 +406,10 @@ class CalibrationStore:
             environment=environment,
             feature_min=tuple(payload["feature_min"]),
             feature_max=tuple(payload["feature_max"]),
+            calibration_mode=payload.get("calibration_mode", CalibrationMode.FAST.value),
+            pipeline_version=payload.get("pipeline_version", "legacy"),
+            feature_range_threshold=payload.get("feature_range_threshold"),
+            screen_affine=tuple(tuple(row) for row in payload.get("screen_affine", ())),
+            validation_hits=payload.get("validation_hits"),
+            validation_total=payload.get("validation_total"),
         )
