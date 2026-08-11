@@ -189,3 +189,23 @@ def test_session_prepares_stable_balanced_point_samples():
     assert features.shape == (6, 1)
     assert np.max(features[:3]) < 10.0
     assert labels.tolist() == [[100.0, 200.0]] * 3 + [[300.0, 400.0]] * 3
+
+
+def test_reference_version_rejects_but_preserves_lightweight_calibration(tmp_path: Path):
+    old_environment = CalibrationEnvironment(1920, 1080, 1.0, 0, "gaze-grid-v2")
+    metadata = CalibrationMetadata(
+        "cal-lightweight",
+        "2026-08-11T12:00:00+08:00",
+        old_environment,
+        (0.0, 0.0),
+        (2.0, 2.0),
+    )
+    store = CalibrationStore(tmp_path)
+    stored = store.save(FakeModel(), metadata)
+    reference_environment = CalibrationEnvironment(
+        1920, 1080, 1.0, 0, "gaze-grid-v3-reference"
+    )
+
+    assert store.load(reference_environment) is None
+    assert stored.model_path.is_file()
+    assert (tmp_path / "current.json").is_file()

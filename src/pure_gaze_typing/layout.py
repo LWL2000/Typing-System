@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-LAYOUT_VERSION = "gaze-grid-v2"
+LAYOUT_VERSION = "gaze-grid-v3-reference"
 
 
 @dataclass(frozen=True)
