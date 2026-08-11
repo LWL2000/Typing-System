@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import time
+
+from PyQt6.QtCore import QObject, pyqtSignal
+
+from .eyetrax_runtime import CenterDriftCorrector
+from .gaze_selection import DwellSelector, TripleBlinkDetector
+from .layout import LAYOUT_VERSION, LayoutSpec, build_layout, hit_test
+from .paths import AppPaths
+from .protocol import GazeSample, Heartbeat, ProtocolMessage, UdpReceiver
+from .session_log import SessionRecorder
+from .settings import TypingSettings
+from .typing_engine import PageKind, TargetSpec, TypingEngine
+
+
+@dataclass(frozen=True)
+class ConnectionStatus:
+    online: bool
+    calibration_compatible: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class ControllerUpdate:
+    status: ConnectionStatus
+    target_labels: tuple[str, ...]
+    page_kind: PageKind
+    current_text: str
+    gaze_point: tuple[float, float] | None
+    dwell_target_id: str | None
+    dwell_progress: float
+    blink_count: int
+    message: str
+    preparing: bool
+
+
+class TypingController(QObject):
+    status_changed = pyqtSignal(object)
+    update_ready = pyqtSignal(object)
+    session_finished = pyqtSignal(str)
+
+    def __init__(
+        self,
+        paths: AppPaths,
+        settings: TypingSettings,
+        screen_width: int,
+        screen_height: int,
+        *,
+        receiver: UdpReceiver | None = None,
+    ) -> None:
+        super().__init__()
+        self.paths = paths
+        self.settings = settings
+        self.layout: LayoutSpec = build_layout(screen_width, screen_height)
+        self.receiver = receiver or UdpReceiver()
+        self.engine = TypingEngine()
+        self.dwell = self._new_dwell(settings)
+        self.blinks = TripleBlinkDetector()
+        self.drift = CenterDriftCorrector(screen_width, screen_height)
+        self.recorder: SessionRecorder | None = None
+        self._status = ConnectionStatus(False, False, "等待眼动采集程序")
+        self._expected_calibration_id = ""
+        self._valid_streak = 0
+        self._last_message_at: float | None = None
+        self._last_gaze_point: tuple[float, float] | None = None
+        self._last_dwell_target: str | None = None
+        self._last_dwell_progress = 0.0
+        self._blink_count = 0
+        self._message = ""
+        self._preparing = False
+        self._prepare_started_at: float | None = None
+        self.last_triggered_target: str | None = None
+
+    @property
+    def status(self) -> ConnectionStatus:
+        return self._status
+
+    def update_settings(self, settings: TypingSettings) -> None:
+        self.settings = settings
+        self.dwell = self._new_dwell(settings)
+
+    def start_session(self, *, skip_prepare: bool = False) -> None:
+        if self.recorder is not None:
+            self.end_session()
+        self.engine = TypingEngine()
+        self.dwell = self._new_dwell(self.settings)
+        self.blinks.reset()
+        self.drift = CenterDriftCorrector(self.layout.screen_width, self.layout.screen_height)
+        self.recorder = SessionRecorder.start(
+            self.paths,
+            self.settings,
+            {
+                "calibration_id": self._expected_calibration_id,
+                "layout_version": self.layout.version,
+                "screen_width": self.layout.screen_width,
+                "screen_height": self.layout.screen_height,
+            },
+            error_callback=lambda message: self._set_message(message),
+        )
+        self._preparing = not skip_prepare
+        self._prepare_started_at = None
+        self._message = "请注视屏幕中心" if self._preparing else ""
+        self._emit_update()
+
+    def end_session(self) -> None:
+        if self.recorder is not None:
+            self.recorder.finish(self.engine.full_text())
+            self.recorder = None
+
+    def close(self) -> None:
+        self.end_session()
+        self.receiver.close()
+
+    def tick(self, now: float | None = None) -> ControllerUpdate:
+        current = time.monotonic() if now is None else float(now)
+        for message in self.receiver.poll():
+            self.process_message(message, current)
+        if self._last_message_at is not None and current - self._last_message_at > 2.0:
+            self._disconnect("眼动连接中断")
+        return self.current_update()
+
+    def process_message(self, message: ProtocolMessage, now: float) -> ControllerUpdate:
+        current = float(now)
+        self._last_message_at = current
+        if isinstance(message, Heartbeat):
+            compatible = message.calibration_ready and message.layout_version == self.layout.version
+            self._expected_calibration_id = message.calibration_id if compatible else ""
+            if not message.camera_ok:
+                self._disconnect("摄像头未就绪")
+            elif not compatible:
+                self._set_status(False, False, "校准不可用或界面尺寸不匹配")
+            elif not self._status.online:
+                self._set_status(False, True, "眼动已连接，正在确认有效数据")
+            return self.current_update()
+
+        compatible = (
+            bool(self._expected_calibration_id)
+            and message.calibration_id == self._expected_calibration_id
+            and message.layout_version == self.layout.version
+        )
+        if not compatible:
+            self._valid_streak = 0
+            self._set_status(False, False, "眼动校准标识不匹配")
+            self.dwell.reset()
+            return self.current_update()
+
+        if message.valid:
+            self._valid_streak += 1
+            if self._valid_streak >= 5 and not self._status.online:
+                self._set_status(True, True, "眼动已连接")
+        elif not message.blink and not self._status.online:
+            self._valid_streak = 0
+
+        blink_update = self.blinks.update(
+            current,
+            face_detected=message.face_detected,
+            blink=message.blink,
+        )
+        self._blink_count = blink_update.count
+        if blink_update.triple_blink and self.engine.page_kind is not PageKind.MAIN:
+            self.engine.return_to_main()
+            self.dwell.reset()
+            self.last_triggered_target = "triple_blink_return"
+            self._set_message("已返回主菜单")
+            self._record_event("triple_blink_return", {})
+            self._emit_update()
+            return self.current_update()
+
+        if not self._status.online:
+            self._emit_update()
+            return self.current_update()
+
+        corrected: tuple[float, float] | None = None
+        if message.valid and message.screen_x is not None and message.screen_y is not None:
+            corrected = self.drift.apply(message.screen_x, message.screen_y)
+            self._last_gaze_point = corrected
+
+        if self._preparing:
+            self._process_prepare(message, current, corrected)
+            self._record_gaze(message, None, 0.0)
+            self._emit_update()
+            return self.current_update()
+
+        geometry_target = None
+        if corrected is not None:
+            include_back = self.engine.page_kind is not PageKind.MAIN and not self.engine.paused
+            geometry_target = hit_test(
+                self.layout,
+                corrected[0],
+                corrected[1],
+                include_back=include_back,
+            )
+        logical_target = self._logical_target(geometry_target)
+        dwell_update = self.dwell.update(
+            current,
+            geometry_target,
+            valid=message.valid,
+            blink=message.blink,
+        )
+        self._last_dwell_target = dwell_update.target_id
+        self._last_dwell_progress = dwell_update.progress
+        self._record_gaze(message, geometry_target, dwell_update.progress)
+        if dwell_update.triggered_target_id is not None:
+            triggered_logical = self._logical_target(dwell_update.triggered_target_id)
+            if triggered_logical is not None:
+                self._activate(triggered_logical)
+        elif logical_target is None and not message.blink:
+            self._message = ""
+        self._emit_update()
+        return self.current_update()
+
+    def current_update(self) -> ControllerUpdate:
+        labels = ["" for _ in range(6)]
+        for target in self.engine.targets():
+            labels[target.position] = target.label
+        return ControllerUpdate(
+            self._status,
+            tuple(labels),
+            self.engine.page_kind,
+            self.engine.full_text(),
+            self._last_gaze_point,
+            self._last_dwell_target,
+            self._last_dwell_progress,
+            self._blink_count,
+            self._message,
+            self._preparing,
+        )
+
+    def _new_dwell(self, settings: TypingSettings) -> DwellSelector:
+        return DwellSelector(
+            settings.dwell_seconds,
+            target_dwell_seconds={"back": max(settings.dwell_seconds, 1.2)},
+        )
+
+    def _process_prepare(
+        self,
+        message: GazeSample,
+        now: float,
+        corrected: tuple[float, float] | None,
+    ) -> None:
+        if corrected is None or not message.valid or message.blink:
+            return
+        if self._prepare_started_at is None:
+            self._prepare_started_at = now
+        self.drift.collect(message.screen_x, message.screen_y)
+        if now - self._prepare_started_at >= 1.0:
+            self.drift.finish((self.layout.screen_width / 2.0, self.layout.screen_height / 2.0))
+            self._preparing = False
+            self._message = ""
+
+    def _logical_target(self, geometry_target: str | None) -> str | None:
+        if geometry_target == "back":
+            return "back"
+        if geometry_target is None or not geometry_target.startswith("target_"):
+            return None
+        position = int(geometry_target.removeprefix("target_"))
+        target = next((item for item in self.engine.targets() if item.position == position), None)
+        return None if target is None else target.target_id
+
+    def _activate(self, logical_target: str) -> None:
+        self.last_triggered_target = logical_target
+        self._last_dwell_target = None
+        self._last_dwell_progress = 0.0
+        if logical_target == "back":
+            self.engine.return_to_main()
+            self._set_message("已返回主菜单")
+            self._record_event("gaze_return", {})
+            return
+        effect = self.engine.activate(logical_target)
+        self._record_event("selection", {"target_id": logical_target, "action": effect.action})
+        if effect.requires_clear_confirmation:
+            self._set_message("请再次凝视“清空”确认")
+        elif effect.sent_text is not None:
+            if self.recorder is None:
+                self._set_message("当前没有实验记录，无法发送")
+                return
+            if self.recorder.finish(effect.sent_text):
+                self.engine.confirm_send()
+                self.recorder = None
+                self._set_message("文本已保存")
+                self.session_finished.emit(effect.sent_text)
+            else:
+                self._set_message("文本保存失败，内容已保留")
+        elif effect.action == "pause":
+            self._set_message("已暂停，凝视“继续”恢复")
+        elif effect.action == "resume":
+            self._set_message("")
+
+    def _record_gaze(self, sample: GazeSample, target_id: str | None, progress: float) -> None:
+        if self.recorder is not None:
+            self.recorder.record_gaze(sample, target_id, progress)
+
+    def _record_event(self, name: str, payload: dict[str, object]) -> None:
+        if self.recorder is not None:
+            self.recorder.record_event(name, payload)
+
+    def _disconnect(self, message: str) -> None:
+        self._valid_streak = 0
+        self.dwell.reset()
+        self.blinks.reset()
+        self._last_dwell_target = None
+        self._last_dwell_progress = 0.0
+        self._set_status(False, self._status.calibration_compatible, message)
+
+    def _set_status(self, online: bool, compatible: bool, message: str) -> None:
+        status = ConnectionStatus(online, compatible, message)
+        if status != self._status:
+            self._status = status
+            self.status_changed.emit(status)
+            self._emit_update()
+
+    def _set_message(self, message: str) -> None:
+        self._message = message
+        self._emit_update()
+
+    def _emit_update(self) -> None:
+        self.update_ready.emit(self.current_update())
