@@ -1,6 +1,11 @@
 import pytest
 
-from pure_gaze_typing.layout import build_layout, calibration_points, hit_test
+from pure_gaze_typing.layout import (
+    build_layout,
+    calibration_points,
+    hit_test,
+    uniform_grid_calibration_points,
+)
 
 
 def test_layout_has_six_stable_targets_and_back_region():
@@ -38,3 +43,23 @@ def test_gaps_and_hidden_back_region_do_not_select_targets():
     layout = build_layout(1000, 1000)
     assert hit_test(layout, 335.0, 330.0, include_back=False) is None
     assert hit_test(layout, *layout.back_target.center, include_back=False) is None
+
+
+def test_reference_grid_uses_nine_cell_centers_in_snake_order():
+    layout = build_layout(900, 600)
+
+    points = uniform_grid_calibration_points(layout)
+
+    assert [name for name, _point in points] == [
+        "grid_0_0",
+        "grid_0_1",
+        "grid_0_2",
+        "grid_1_2",
+        "grid_1_1",
+        "grid_1_0",
+        "grid_2_0",
+        "grid_2_1",
+        "grid_2_2",
+    ]
+    assert points[0][1] == pytest.approx((150.0, 100.0))
+    assert points[-1][1] == pytest.approx((750.0, 500.0))

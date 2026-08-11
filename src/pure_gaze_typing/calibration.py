@@ -237,6 +237,26 @@ class CalibrationSession:
         upper = np.percentile(features, 98, axis=0)
         return tuple(map(float, lower)), tuple(map(float, upper))
 
+    def prepared_training_data(
+        self,
+        *,
+        max_samples_per_point: int,
+        min_samples: int = 8,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.complete:
+            raise RuntimeError("calibration is not complete")
+        groups: list[tuple[tuple[float, float], np.ndarray]] = []
+        for point, point_features in zip(self.points, self._features):
+            stable = filter_stable_features(
+                point_features,
+                max_samples=max_samples_per_point,
+                min_samples=min_samples,
+            )
+            if stable.shape[0] < min_samples:
+                raise RuntimeError(f"too few stable samples at {point.target_id}")
+            groups.append(((point.screen_x, point.screen_y), stable))
+        return balance_point_samples(groups)
+
 
 def filter_stable_features(
     features: Sequence[object] | np.ndarray,

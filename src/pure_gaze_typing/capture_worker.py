@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import time
 
@@ -27,6 +27,8 @@ class CameraWorker(QObject):
     camera_opened = pyqtSignal(bool, str)
     preview_ready = pyqtSignal(object)
     packet_ready = pyqtSignal(object)
+    model_trained = pyqtSignal(object)
+    model_configured = pyqtSignal(object)
     model_saved = pyqtSignal(object)
     failed = pyqtSignal(str)
     stopped = pyqtSignal()
@@ -93,11 +95,34 @@ class CameraWorker(QObject):
             self._first_frame_logged = True
 
     @pyqtSlot(object, object, object)
-    def train_and_save(self, features, labels, metadata: CalibrationMetadata) -> None:
+    def train_model(self, features, labels, metadata: CalibrationMetadata) -> None:
         if self._timer is not None:
             self._timer.stop()
         try:
             self.runtime.train(features, labels)
+            threshold = self.runtime.feature_range_threshold(features)
+            metadata = replace(metadata, feature_range_threshold=threshold)
+            self.runtime.set_metadata(metadata)
+            self.model_trained.emit(metadata)
+        except Exception as error:
+            self.failed.emit(f"校准模型训练失败：{error}")
+        finally:
+            if self._timer is not None:
+                self._timer.start(0)
+
+    @pyqtSlot(object)
+    def configure_metadata(self, metadata: CalibrationMetadata) -> None:
+        try:
+            self.runtime.set_metadata(metadata)
+            self.model_configured.emit(metadata)
+        except Exception as error:
+            self.failed.emit(f"校准偏差修正失败：{error}")
+
+    @pyqtSlot(object)
+    def save_current(self, metadata: CalibrationMetadata) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+        try:
             self.runtime.set_metadata(metadata)
             stored = self.store.save(self.runtime, metadata)
             self.model_saved.emit(stored)

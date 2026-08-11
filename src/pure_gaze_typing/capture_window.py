@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import logging
 import time
@@ -22,15 +23,27 @@ from PyQt6.QtWidgets import (
 
 from .calibration import (
     CalibrationEnvironment,
+    CalibrationMode,
     CalibrationMetadata,
     CalibrationPoint,
+    CalibrationProfile,
     CalibrationSession,
     CalibrationStore,
+    REFERENCE_PIPELINE_VERSION,
+    apply_screen_affine,
+    calibration_profile,
+    fit_screen_affine,
     score_validation,
 )
 from .capture_worker import CameraWorker, CapturePacket
 from .eyetrax_runtime import EyeTraxRuntime
-from .layout import LAYOUT_VERSION, build_layout, calibration_points, hit_test
+from .layout import (
+    LAYOUT_VERSION,
+    build_layout,
+    calibration_points,
+    hit_test,
+    uniform_grid_calibration_points,
+)
 from .paths import AppPaths
 from .protocol import GazeSample, Heartbeat, UdpPublisher
 
@@ -45,6 +58,8 @@ class CaptureController(QObject):
     stream_state_changed = pyqtSignal(bool, str)
     preview_ready = pyqtSignal(object)
     _train_requested = pyqtSignal(object, object, object)
+    _configure_requested = pyqtSignal(object)
+    _save_requested = pyqtSignal(object)
 
     def __init__(
         self,
@@ -69,9 +84,20 @@ class CaptureController(QObject):
         self._camera_ready = False
         self._streaming = False
         self._session: CalibrationSession | None = None
+        self._profile: CalibrationProfile = calibration_profile(CalibrationMode.FAST)
+        self._calibration_active = False
+        self._retrying = False
         self._validate_after_training = False
         self._training_sent = False
         self._base_training: tuple[np.ndarray, np.ndarray] | None = None
+        self._provisional_metadata: CalibrationMetadata | None = None
+        self._prediction_stage: str | None = None
+        self._prediction_target_ids: tuple[str, ...] = ()
+        self._prediction_index: int | None = None
+        self._prediction_started_at: float | None = None
+        self._prediction_samples: list[tuple[float, float]] = []
+        self._bias_predictions: dict[str, tuple[float, float]] = {}
+        self._after_configure: str | None = None
         self._validation_index: int | None = None
         self._validation_started_at: float | None = None
         self._validation_hits: dict[str, int] = {}
@@ -109,48 +135,89 @@ class CaptureController(QObject):
         self.worker.camera_opened.connect(self._on_camera_state)
         self.worker.preview_ready.connect(self.preview_ready)
         self.worker.packet_ready.connect(self._on_packet)
+        self.worker.model_trained.connect(self._on_model_trained)
+        self.worker.model_configured.connect(self._on_model_configured)
         self.worker.model_saved.connect(self._on_model_saved)
         self.worker.failed.connect(self._on_worker_failure)
         self.worker.stopped.connect(self.worker.deleteLater)
         self.worker.stopped.connect(self.thread.quit)
-        self._train_requested.connect(self.worker.train_and_save)
+        self._train_requested.connect(self.worker.train_model)
+        self._configure_requested.connect(self.worker.configure_metadata)
+        self._save_requested.connect(self.worker.save_current)
         self.thread.start()
         LOGGER.info("camera_thread_started")
 
-    def start_calibration(self, validate: bool) -> None:
+    def start_calibration(
+        self,
+        mode: CalibrationMode | str | bool = CalibrationMode.FAST,
+        validate: bool = False,
+    ) -> None:
+        if isinstance(mode, bool):
+            validate = mode
+            mode = CalibrationMode.FAST
         if not self._camera_ready or self.environment is None:
             self.calibration_finished.emit(False, "请先连接摄像头", ())
             return
-        layout = build_layout(self.environment.screen_width, self.environment.screen_height)
-        points = tuple(
-            CalibrationPoint(name, x, y, 1.0 if name == "center" else 0.8)
-            for name, (x, y) in calibration_points(layout)
-        )
-        self._start_session(points, validate)
-
-    def _start_session(self, points: tuple[CalibrationPoint, ...], validate: bool) -> None:
-        self._session = CalibrationSession(points)
+        self._profile = calibration_profile(mode)
         self._validate_after_training = bool(validate)
+        self._calibration_active = True
+        self._retrying = False
+        self._streaming = False
+        self._base_training = None
+        self._provisional_metadata = None
+        self._validation_hits = {f"target_{index}": 0 for index in range(6)}
+        self._failed_targets = ()
+        layout = build_layout(self.environment.screen_width, self.environment.screen_height)
+        duration = self._profile.settle_seconds + self._profile.capture_seconds
+        center = (layout.screen_width / 2.0, layout.screen_height / 2.0)
+        point_specs: list[tuple[str, tuple[float, float], float]] = [
+            ("pose_center", center, self._profile.pose_hold_seconds),
+        ]
+        point_specs.extend(
+            (name, point, duration) for name, point in uniform_grid_calibration_points(layout)
+        )
+        target_points = list(calibration_points(layout))
+        for pass_index in range(self._profile.target_passes):
+            ordered = target_points
+            if pass_index == 1 and self._profile.reverse_second_pass:
+                ordered = [target_points[0], *reversed(target_points[1:])]
+            point_specs.extend((name, point, duration) for name, point in ordered)
+        points = tuple(
+            CalibrationPoint(name, point[0], point[1], point_duration)
+            for name, point, point_duration in point_specs
+        )
+        self._start_training_session(points)
+
+    def _start_training_session(self, points: tuple[CalibrationPoint, ...]) -> None:
+        self._session = CalibrationSession(
+            points,
+            settle_seconds=self._profile.settle_seconds,
+            min_valid_frames=8,
+            max_point_seconds=max(2.0, self._profile.settle_seconds + self._profile.capture_seconds * 2.5),
+        )
         self._training_sent = False
+        self._prediction_stage = None
+        self._prediction_index = None
         self._validation_index = None
-        self._validation_hits.clear()
         if self._session.current_point_id:
             self.calibration_point_changed.emit(self._session.current_point_id)
 
     def retry_failed_regions(self) -> None:
         if not self._failed_targets or self.environment is None:
             return
+        self._calibration_active = True
+        self._retrying = True
         layout = build_layout(self.environment.screen_width, self.environment.screen_height)
         point_map = dict(calibration_points(layout))
+        duration = self._profile.settle_seconds + self._profile.capture_seconds
         points = tuple(
-            CalibrationPoint(target_id, *point_map[target_id], 0.8)
+            CalibrationPoint(target_id, *point_map[target_id], duration)
             for target_id in self._failed_targets
         )
-        self._start_session(points, True)
+        self._start_training_session(points)
 
     def save_anyway(self) -> None:
-        self._validation_index = None
-        self.calibration_finished.emit(True, "校准已保存（已跳过未命中区域）", ())
+        self.calibration_finished.emit(False, "精度验证开启时必须达到至少 5/6", self._failed_targets)
 
     def start_streaming(self) -> None:
         if self.worker is None or self.runtime is None or self.runtime.metadata is None:
@@ -214,63 +281,193 @@ class CaptureController(QObject):
                 self.calibration_point_changed.emit(after)
             if self._session.complete and not self._training_sent:
                 self._train_completed_session()
-        elif self._validation_index is not None:
-            self._process_validation(packet)
+        elif self._prediction_stage is not None:
+            self._process_prediction_stage(packet)
         if self._streaming:
             self._publish_estimate(packet)
 
     def _train_completed_session(self) -> None:
         assert self._session is not None and self.environment is not None
-        features, labels = self._session.training_data()
+        features, labels = self._session.prepared_training_data(
+            max_samples_per_point=self._profile.max_samples_per_point,
+            min_samples=8,
+        )
         if self._base_training is not None:
             features = np.vstack((self._base_training[0], features))
             labels = np.vstack((self._base_training[1], labels))
         self._base_training = (features.copy(), labels.copy())
         lower = tuple(map(float, np.percentile(features, 2, axis=0)))
         upper = tuple(map(float, np.percentile(features, 98, axis=0)))
+        previous = self._provisional_metadata
         metadata = CalibrationMetadata(
-            f"cal-{uuid.uuid4().hex[:12]}",
-            datetime.now(timezone.utc).isoformat(),
+            f"cal-{uuid.uuid4().hex[:12]}" if previous is None else previous.calibration_id,
+            datetime.now(timezone.utc).isoformat() if previous is None else previous.created_at,
             self.environment,
             lower,
             upper,
+            calibration_mode=self._profile.mode.value,
+            pipeline_version=REFERENCE_PIPELINE_VERSION,
+            screen_affine=() if previous is None else previous.screen_affine,
         )
         self._training_sent = True
         self._session = None
         self._train_requested.emit(features, labels, metadata)
 
-    def _on_model_saved(self, _stored) -> None:
-        if self._validate_after_training:
-            self._validation_index = 0
-            self._validation_started_at = None
-            self._validation_hits = {f"target_{index}": 0 for index in range(6)}
-            self.calibration_point_changed.emit("target_0")
+    def _on_model_trained(self, metadata: CalibrationMetadata) -> None:
+        self._provisional_metadata = metadata
+        if self.environment is None:
+            return
+        if self._retrying:
+            target_ids = self._failed_targets
         else:
-            self.calibration_finished.emit(True, "快速校准已保存", ())
+            target_ids = tuple(name for name, _point in calibration_points(
+                build_layout(self.environment.screen_width, self.environment.screen_height)
+            ))
+        self._bias_predictions = {}
+        self._start_prediction_stage("bias", target_ids)
 
-    def _process_validation(self, packet: CapturePacket) -> None:
-        assert self.environment is not None and self._validation_index is not None
+    def _start_prediction_stage(self, stage: str, target_ids: tuple[str, ...]) -> None:
+        if not target_ids:
+            raise ValueError("prediction stage requires at least one target")
+        self._prediction_stage = stage
+        self._prediction_target_ids = tuple(target_ids)
+        self._prediction_index = 0
+        self._prediction_started_at = None
+        self._prediction_samples = []
+        self.calibration_point_changed.emit(self._prediction_target_ids[0])
+
+    def _process_prediction_stage(self, packet: CapturePacket) -> None:
+        assert self._prediction_stage is not None and self._prediction_index is not None
         now = packet.timestamp
-        if self._validation_started_at is None:
-            self._validation_started_at = now
-        target_id = f"target_{self._validation_index}"
+        if self._prediction_started_at is None:
+            self._prediction_started_at = now
+        elapsed = now - self._prediction_started_at
+        settle = self._profile.validation_settle_seconds
+        capture = self._profile.validation_capture_seconds
         estimate = packet.estimate
-        if estimate.valid and estimate.screen_x is not None and estimate.screen_y is not None:
-            layout = build_layout(self.environment.screen_width, self.environment.screen_height)
-            if hit_test(layout, estimate.screen_x, estimate.screen_y, include_back=False) == target_id:
-                self._validation_hits[target_id] += 1
-        if now - self._validation_started_at < 0.8:
+        if (
+            elapsed >= settle
+            and estimate.valid
+            and estimate.raw_x is not None
+            and estimate.raw_y is not None
+            and np.isfinite(estimate.raw_x)
+            and np.isfinite(estimate.raw_y)
+        ):
+            self._prediction_samples.append((estimate.raw_x, estimate.raw_y))
+        if elapsed < settle + capture:
             return
-        self._validation_index += 1
-        self._validation_started_at = None
-        if self._validation_index < 6:
-            self.calibration_point_changed.emit(f"target_{self._validation_index}")
+        if len(self._prediction_samples) < 3:
+            target_id = self._prediction_target_ids[self._prediction_index]
+            self._prediction_stage = None
+            self._calibration_active = False
+            self.calibration_finished.emit(False, f"{target_id} 有效注视样本不足，请重试", (target_id,))
             return
-        result = score_validation(self._validation_hits)
-        self._validation_index = None
+
+        target_id = self._prediction_target_ids[self._prediction_index]
+        median_prediction = tuple(
+            map(float, np.median(np.asarray(self._prediction_samples, dtype=float), axis=0))
+        )
+        if self._prediction_stage == "bias":
+            self._bias_predictions[target_id] = median_prediction
+        else:
+            self._record_validation_result(target_id, median_prediction)
+
+        self._prediction_index += 1
+        self._prediction_started_at = None
+        self._prediction_samples = []
+        if self._prediction_index < len(self._prediction_target_ids):
+            self.calibration_point_changed.emit(self._prediction_target_ids[self._prediction_index])
+            return
+
+        completed_stage = self._prediction_stage
+        self._prediction_stage = None
+        self._prediction_index = None
+        if completed_stage == "bias":
+            self._finish_bias_correction()
+        else:
+            self._finish_validation()
+
+    def _point_map(self) -> dict[str, tuple[float, float]]:
+        assert self.environment is not None
+        layout = build_layout(self.environment.screen_width, self.environment.screen_height)
+        return dict(calibration_points(layout))
+
+    def _finish_bias_correction(self) -> None:
+        assert self._provisional_metadata is not None
+        point_map = self._point_map()
+        names = tuple(self._bias_predictions)
+        predictions = np.asarray([self._bias_predictions[name] for name in names], dtype=float)
+        targets = np.asarray([point_map[name] for name in names], dtype=float)
+        if self._retrying and self._provisional_metadata.screen_affine:
+            matrix = np.asarray(self._provisional_metadata.screen_affine, dtype=float).copy()
+            corrected = np.column_stack((predictions, np.ones(len(predictions)))) @ matrix
+            matrix[2] += np.median(targets - corrected, axis=0)
+        else:
+            matrix = fit_screen_affine(predictions, targets)
+        coefficients = tuple(tuple(map(float, row)) for row in matrix)
+        self._provisional_metadata = replace(
+            self._provisional_metadata,
+            screen_affine=coefficients,
+        )
+        self._after_configure = "validate" if self._validate_after_training else "save"
+        self._configure_requested.emit(self._provisional_metadata)
+
+    def _on_model_configured(self, metadata: CalibrationMetadata) -> None:
+        self._provisional_metadata = metadata
+        action = self._after_configure
+        self._after_configure = None
+        if action == "validate":
+            target_ids = self._failed_targets if self._retrying else tuple(
+                f"target_{index}" for index in range(6)
+            )
+            self._start_prediction_stage("validation", target_ids)
+        elif action == "save":
+            self._save_requested.emit(metadata)
+
+    def _record_validation_result(
+        self,
+        target_id: str,
+        raw_prediction: tuple[float, float],
+    ) -> None:
+        assert self.environment is not None and self._provisional_metadata is not None
+        corrected = apply_screen_affine(
+            self._provisional_metadata.screen_affine,
+            raw_prediction[0],
+            raw_prediction[1],
+        )
+        layout = build_layout(self.environment.screen_width, self.environment.screen_height)
+        self._validation_hits[target_id] = int(
+            hit_test(layout, corrected[0], corrected[1], include_back=False) == target_id
+        )
+
+    def _finish_validation(self) -> None:
+        result = score_validation(self._validation_hits, min_hits_per_target=1)
         self._failed_targets = result.failed_target_ids
         message = f"命中 {result.hit_count}/{result.total_count}"
-        self.calibration_finished.emit(result.passed, message, result.failed_target_ids)
+        if result.passed:
+            assert self._provisional_metadata is not None
+            self._provisional_metadata = replace(
+                self._provisional_metadata,
+                validation_hits=result.hit_count,
+                validation_total=result.total_count,
+            )
+            self._save_requested.emit(self._provisional_metadata)
+            return
+        self._calibration_active = False
+        self.calibration_finished.emit(False, message, result.failed_target_ids)
+
+    def _on_model_saved(self, _stored) -> None:
+        self._calibration_active = False
+        self._retrying = False
+        mode_name = "精确校准" if self._profile.mode is CalibrationMode.PRECISE else "快速校准"
+        if self._validate_after_training and self._provisional_metadata is not None:
+            message = (
+                f"{mode_name}已保存，命中 "
+                f"{self._provisional_metadata.validation_hits}/{self._provisional_metadata.validation_total}"
+            )
+        else:
+            message = f"{mode_name}已保存"
+        self.calibration_finished.emit(True, message, ())
 
     def _publish_estimate(self, packet: CapturePacket) -> None:
         assert self.runtime is not None and self.runtime.metadata is not None
@@ -293,7 +490,11 @@ class CaptureController(QObject):
         self.publisher.send(sample)
 
     def _publish_heartbeat(self) -> None:
-        metadata = self.runtime.metadata if self.runtime is not None else None
+        metadata = (
+            self.runtime.metadata
+            if self.runtime is not None and not self._calibration_active
+            else None
+        )
         heartbeat = Heartbeat(
             timestamp=time.time(),
             camera_ok=self._camera_ready,
@@ -429,7 +630,7 @@ class CaptureWindow(QMainWindow):
             self.showNormal()
         show_choices = not passed and bool(failed_targets)
         self.retry_failed_button.setVisible(show_choices)
-        self.save_anyway_button.setVisible(show_choices)
+        self.save_anyway_button.hide()
         self.update()
 
     def _on_stream_state(self, running: bool, message: str) -> None:

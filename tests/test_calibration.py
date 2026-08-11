@@ -168,3 +168,24 @@ def test_store_round_trip_preserves_reference_pipeline_metadata(tmp_path: Path):
     store.save(FakeModel(), metadata)
 
     assert store.load(environment).metadata == metadata
+
+
+def test_session_prepares_stable_balanced_point_samples():
+    session = CalibrationSession(
+        (
+            CalibrationPoint("first", 100.0, 200.0, 0.1),
+            CalibrationPoint("second", 300.0, 400.0, 0.1),
+        ),
+        settle_seconds=0.0,
+        min_valid_frames=3,
+    )
+    for timestamp, value in ((0.0, 0.0), (0.04, 0.1), (0.08, 99.0), (0.11, 0.2)):
+        session.add_frame(timestamp, np.array([value]), blink=False, face_detected=True)
+    for timestamp, value in ((0.2, 1.0), (0.24, 1.1), (0.28, 1.2), (0.31, 1.3)):
+        session.add_frame(timestamp, np.array([value]), blink=False, face_detected=True)
+
+    features, labels = session.prepared_training_data(max_samples_per_point=3, min_samples=3)
+
+    assert features.shape == (6, 1)
+    assert np.max(features[:3]) < 10.0
+    assert labels.tolist() == [[100.0, 200.0]] * 3 + [[300.0, 400.0]] * 3

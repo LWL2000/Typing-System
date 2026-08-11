@@ -86,6 +86,19 @@ def calibration_points(
     return tuple(points)
 
 
+def uniform_grid_calibration_points(
+    layout: LayoutSpec,
+) -> tuple[tuple[str, tuple[float, float]], ...]:
+    points: list[tuple[str, tuple[float, float]]] = []
+    for row in range(3):
+        columns = range(3) if row % 2 == 0 else reversed(range(3))
+        for column in columns:
+            x = (float(column) + 0.5) * float(layout.screen_width) / 3.0
+            y = (float(row) + 0.5) * float(layout.screen_height) / 3.0
+            points.append((f"grid_{row}_{column}", (x, y)))
+    return tuple(points)
+
+
 def hit_test(
     layout: LayoutSpec,
     x: float,
