@@ -2,11 +2,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 
 import pure_gaze_typing.capture_window as capture_module
 from pure_gaze_typing.calibration import CalibrationEnvironment
-from pure_gaze_typing.calibration import CalibrationMetadata
+from pure_gaze_typing.calibration import CalibrationMetadata, CalibrationMode
 from pure_gaze_typing.capture_worker import CameraWorker
 from pure_gaze_typing.capture_window import CaptureController, CaptureWindow
 from pure_gaze_typing.layout import build_layout
@@ -20,11 +20,19 @@ class FakeCaptureController(QObject):
     stream_state_changed = pyqtSignal(bool, str)
     preview_ready = pyqtSignal(object)
 
+    def __init__(self):
+        super().__init__()
+        self.calibration_calls = []
+        self.cancel_calls = 0
+
     def start_camera(self, _index):
         return None
 
-    def start_calibration(self, _validate):
-        return None
+    def start_calibration(self, mode, validate=False):
+        self.calibration_calls.append((mode, validate))
+
+    def cancel_calibration(self):
+        self.cancel_calls += 1
 
     def start_streaming(self):
         return None
@@ -99,6 +107,60 @@ def test_calibration_scene_uses_shared_layout_centers(qtbot, tmp_path: Path):
     assert window.highlight_center() == pytest.approx(
         build_layout(1280, 720).targets[3].center
     )
+
+
+def test_calibration_button_opens_fullscreen_mode_menu_with_estimates(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window._begin_calibration()
+
+    assert window.mode_dialog is not None
+    assert window.mode_dialog.isFullScreen()
+    assert "25–35 秒" in window.mode_dialog.fast_button.text()
+    assert "50–60 秒" in window.mode_dialog.precise_button.text()
+    assert controller.calibration_calls == []
+
+
+def test_mode_menu_starts_selected_calibration_with_validation_choice(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.validation_checkbox.setChecked(True)
+    window._begin_calibration()
+
+    qtbot.mouseClick(window.mode_dialog.precise_button, Qt.MouseButton.LeftButton)
+
+    assert controller.calibration_calls == [(CalibrationMode.PRECISE, True)]
+    assert window._calibration_mode
+    assert not window._controls.isVisible()
+
+
+def test_escape_from_mode_menu_returns_without_starting(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+    window._begin_calibration()
+
+    qtbot.keyClick(window.mode_dialog, Qt.Key.Key_Escape)
+
+    assert controller.calibration_calls == []
+    assert not window._calibration_mode
+    assert window._controls.isVisible()
+
+
+def test_failed_region_retry_reenters_fullscreen_calibration_scene(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+
+    controller.calibration_point_changed.emit("target_4")
+
+    assert window.isFullScreen()
+    assert not window._controls.isVisible()
+    assert window.highlight_center() == pytest.approx(build_layout(window.width(), window.height()).targets[4].center)
 
 
 def test_failed_validation_exposes_retry_and_save_actions(qtbot, tmp_path: Path):

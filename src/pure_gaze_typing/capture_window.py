@@ -12,6 +12,7 @@ from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -60,6 +61,7 @@ class CaptureController(QObject):
     _train_requested = pyqtSignal(object, object, object)
     _configure_requested = pyqtSignal(object)
     _save_requested = pyqtSignal(object)
+    _load_requested = pyqtSignal(object)
 
     def __init__(
         self,
@@ -144,6 +146,7 @@ class CaptureController(QObject):
         self._train_requested.connect(self.worker.train_model)
         self._configure_requested.connect(self.worker.configure_metadata)
         self._save_requested.connect(self.worker.save_current)
+        self._load_requested.connect(self.worker.load_calibration)
         self.thread.start()
         LOGGER.info("camera_thread_started")
 
@@ -218,6 +221,24 @@ class CaptureController(QObject):
 
     def save_anyway(self) -> None:
         self.calibration_finished.emit(False, "精度验证开启时必须达到至少 5/6", self._failed_targets)
+
+    def cancel_calibration(self) -> None:
+        if not self._calibration_active:
+            return
+        self._calibration_active = False
+        self._session = None
+        self._prediction_stage = None
+        self._prediction_index = None
+        self._after_configure = None
+        self._retrying = False
+        self._provisional_metadata = None
+        if self.environment is not None:
+            stored = self.store.load(self.environment)
+            if stored is not None and self.worker is not None:
+                self._load_requested.emit(stored)
+            elif self.runtime is not None:
+                self.runtime.metadata = None
+        self.calibration_finished.emit(False, "校准已取消", ())
 
     def start_streaming(self) -> None:
         if self.worker is None or self.runtime is None or self.runtime.metadata is None:
@@ -314,6 +335,8 @@ class CaptureController(QObject):
         self._train_requested.emit(features, labels, metadata)
 
     def _on_model_trained(self, metadata: CalibrationMetadata) -> None:
+        if not self._calibration_active:
+            return
         self._provisional_metadata = metadata
         if self.environment is None:
             return
@@ -413,6 +436,8 @@ class CaptureController(QObject):
         self._configure_requested.emit(self._provisional_metadata)
 
     def _on_model_configured(self, metadata: CalibrationMetadata) -> None:
+        if not self._calibration_active:
+            return
         self._provisional_metadata = metadata
         action = self._after_configure
         self._after_configure = None
@@ -457,6 +482,8 @@ class CaptureController(QObject):
         self.calibration_finished.emit(False, message, result.failed_target_ids)
 
     def _on_model_saved(self, _stored) -> None:
+        if not self._calibration_active:
+            return
         self._calibration_active = False
         self._retrying = False
         mode_name = "精确校准" if self._profile.mode is CalibrationMode.PRECISE else "快速校准"
@@ -507,6 +534,64 @@ class CaptureController(QObject):
         self.publisher.send(heartbeat)
 
 
+class CalibrationModeDialog(QDialog):
+    mode_selected = pyqtSignal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择校准方式")
+        self.setModal(True)
+        self.setStyleSheet(
+            "QDialog{background:#f4f6f5;color:#17221e;}"
+            "QLabel{color:#17221e;}"
+            "QPushButton{min-height:76px;min-width:280px;padding:12px 24px;"
+            "border:1px solid #91a29a;border-radius:4px;background:#ffffff;"
+            "font-size:18px;font-weight:600;text-align:left;}"
+            "QPushButton:hover{border-color:#2f7d62;background:#edf5f1;}"
+            "QPushButton#cancelButton{min-height:42px;min-width:120px;font-size:15px;"
+            "font-weight:400;text-align:center;}"
+        )
+        root = QVBoxLayout(self)
+        root.setContentsMargins(64, 56, 64, 48)
+        root.setSpacing(22)
+        root.addStretch(2)
+        title = QLabel("选择校准方式")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size:30px;font-weight:600;")
+        root.addWidget(title)
+        subtitle = QLabel("保持自然坐姿，按照屏幕上的绿色圆点注视")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setStyleSheet("font-size:17px;color:#516159;")
+        root.addWidget(subtitle)
+
+        choices = QHBoxLayout()
+        choices.setSpacing(24)
+        choices.addStretch()
+        self.fast_button = QPushButton("快速校准（推荐）\n约 25–35 秒")
+        self.precise_button = QPushButton("精确校准\n约 50–60 秒")
+        choices.addWidget(self.fast_button)
+        choices.addWidget(self.precise_button)
+        choices.addStretch()
+        root.addLayout(choices)
+
+        cancel_row = QHBoxLayout()
+        cancel_row.addStretch()
+        self.cancel_button = QPushButton("返回")
+        self.cancel_button.setObjectName("cancelButton")
+        cancel_row.addWidget(self.cancel_button)
+        cancel_row.addStretch()
+        root.addLayout(cancel_row)
+        root.addStretch(3)
+
+        self.fast_button.clicked.connect(lambda: self._choose(CalibrationMode.FAST))
+        self.precise_button.clicked.connect(lambda: self._choose(CalibrationMode.PRECISE))
+        self.cancel_button.clicked.connect(self.reject)
+
+    def _choose(self, mode: CalibrationMode) -> None:
+        self.mode_selected.emit(mode)
+        self.accept()
+
+
 class CaptureWindow(QMainWindow):
     def __init__(self, controller: CaptureController, paths: AppPaths) -> None:
         super().__init__()
@@ -514,6 +599,7 @@ class CaptureWindow(QMainWindow):
         self.paths = paths
         self._calibration_mode = False
         self._highlight_id: str | None = None
+        self.mode_dialog: CalibrationModeDialog | None = None
         self.setWindowTitle("眼动采集校准")
         self.setMinimumSize(920, 640)
         self.setStyleSheet(
@@ -583,14 +669,27 @@ class CaptureWindow(QMainWindow):
         controller.preview_ready.connect(self._on_preview)
 
     def _begin_calibration(self) -> None:
+        self.mode_dialog = CalibrationModeDialog(self)
+        self.mode_dialog.mode_selected.connect(self._start_selected_calibration)
+        self.mode_dialog.rejected.connect(self._cancel_mode_choice)
+        self.mode_dialog.showFullScreen()
+
+    def _start_selected_calibration(self, mode: CalibrationMode) -> None:
         self._calibration_mode = True
         self._controls.hide()
         self.showFullScreen()
-        self.controller.start_calibration(self.validation_checkbox.isChecked())
+        self.controller.start_calibration(mode, self.validation_checkbox.isChecked())
+
+    def _cancel_mode_choice(self) -> None:
+        self._calibration_mode = False
+        self._controls.show()
 
     def show_calibration_point(self, point_id: str) -> None:
         self._calibration_mode = True
         self._highlight_id = point_id
+        self._controls.hide()
+        if not self.isFullScreen():
+            self.showFullScreen()
         self.update()
 
     def highlight_center(self) -> tuple[float, float] | None:
@@ -598,6 +697,8 @@ class CaptureWindow(QMainWindow):
             return None
         layout = build_layout(max(1, self.width()), max(1, self.height()))
         point_map = dict(calibration_points(layout))
+        point_map.update(uniform_grid_calibration_points(layout))
+        point_map["pose_center"] = (layout.screen_width / 2.0, layout.screen_height / 2.0)
         return point_map.get(self._highlight_id)
 
     def paintEvent(self, event) -> None:
@@ -617,6 +718,23 @@ class CaptureWindow(QMainWindow):
             painter.setBrush(QColor("#2f7d62"))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(round(center[0] - 18), round(center[1] - 18), 36, 36)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#2f7d62"), 4))
+            painter.drawEllipse(round(center[0] - 34), round(center[1] - 34), 68, 68)
+        painter.setPen(QColor("#35443d"))
+        font = painter.font()
+        font.setPointSize(18)
+        font.setBold(True)
+        painter.setFont(font)
+        prompt = "保持自然坐姿并注视中心" if self._highlight_id == "pose_center" else "请注视绿色圆点"
+        painter.drawText(
+            0,
+            28,
+            self.width(),
+            44,
+            Qt.AlignmentFlag.AlignCenter,
+            prompt,
+        )
 
     def _on_camera_state(self, ready: bool, message: str) -> None:
         self.camera_status_label.setText(message)
@@ -647,6 +765,13 @@ class CaptureWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._calibration_mode:
+            self.controller.cancel_calibration()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.controller.stop()
