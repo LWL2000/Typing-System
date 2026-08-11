@@ -5,10 +5,12 @@ import pytest
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 
 import pure_gaze_typing.capture_window as capture_module
+import pure_gaze_typing.capture_worker as worker_module
 from pure_gaze_typing.calibration import CalibrationEnvironment, stable_median_prediction
 from pure_gaze_typing.calibration import CalibrationMetadata, CalibrationMode
 from pure_gaze_typing.capture_worker import CameraWorker
 from pure_gaze_typing.capture_window import CaptureController, CaptureWindow
+from pure_gaze_typing.eyetrax_runtime import FrameObservation, GazeEstimate
 from pure_gaze_typing.layout import build_layout
 from pure_gaze_typing.paths import AppPaths
 
@@ -97,6 +99,78 @@ class RecordingStore:
         path = self.root / "model.pkl"
         model.save_model(path)
         return object()
+
+
+class FrameRuntime:
+    def extract(self, _frame):
+        return FrameObservation(np.ones(2), True, False)
+
+    def estimate(self, _observation, *, timestamp):
+        return GazeEstimate(True, True, False, 1.0, 10.0, 20.0, 10.0, 20.0)
+
+
+class FakeVideoCapture:
+    def __init__(self):
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        return True, np.zeros((12, 16, 3), dtype=np.uint8)
+
+    def release(self):
+        self.released = True
+
+
+class FakeTimerSignal:
+    def connect(self, callback):
+        self.callback = callback
+
+
+class FakeTimer:
+    def __init__(self, _parent):
+        self.timeout = FakeTimerSignal()
+        self._interval = -1
+
+    def start(self, interval=0):
+        self._interval = interval
+
+    def stop(self):
+        return None
+
+    def interval(self):
+        return self._interval
+
+
+def test_camera_worker_caps_frame_timer_instead_of_running_unbounded(monkeypatch):
+    capture = FakeVideoCapture()
+    monkeypatch.setattr(worker_module.cv2, "VideoCapture", lambda _index: capture)
+    monkeypatch.setattr(worker_module, "QTimer", FakeTimer)
+    worker = CameraWorker(0, FrameRuntime(), None)
+
+    worker.start()
+
+    assert worker._timer.interval() == 33
+    worker.stop()
+    assert capture.released
+
+
+def test_camera_worker_emits_preview_at_ten_fps_while_preserving_gaze_packets(monkeypatch):
+    worker = CameraWorker(0, FrameRuntime(), None)
+    worker._capture = FakeVideoCapture()
+    timestamps = iter((0.00, 0.03, 0.06, 0.11))
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(timestamps))
+    packets = []
+    previews = []
+    worker.packet_ready.connect(packets.append)
+    worker.preview_ready.connect(previews.append)
+
+    for _index in range(4):
+        worker._read_frame()
+
+    assert len(packets) == 4
+    assert len(previews) == 2
 
 
 def test_validation_is_off_by_default_and_calibration_button_tracks_camera(qtbot, tmp_path: Path):

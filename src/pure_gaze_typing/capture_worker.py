@@ -24,6 +24,9 @@ class CapturePacket:
 
 
 class CameraWorker(QObject):
+    FRAME_INTERVAL_MS = 33
+    PREVIEW_INTERVAL_SECONDS = 0.10
+
     camera_opened = pyqtSignal(bool, str)
     preview_ready = pyqtSignal(object)
     packet_ready = pyqtSignal(object)
@@ -46,6 +49,7 @@ class CameraWorker(QObject):
         self._capture = None
         self._timer: QTimer | None = None
         self._previous_frame_at: float | None = None
+        self._last_preview_at: float | None = None
         self._first_frame_logged = False
 
     @pyqtSlot()
@@ -60,8 +64,8 @@ class CameraWorker(QObject):
             return
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._read_frame)
-        self._timer.start(0)
-        LOGGER.info("camera_timer_started")
+        self._timer.start(self.FRAME_INTERVAL_MS)
+        LOGGER.info("camera_timer_started interval_ms=%s", self.FRAME_INTERVAL_MS)
         self.camera_opened.emit(True, f"摄像头 {self.camera_index} 已连接")
 
     @pyqtSlot()
@@ -86,13 +90,24 @@ class CameraWorker(QObject):
         if not self._first_frame_logged:
             LOGGER.info("camera_first_frame_processed face_detected=%s", observation.face_detected)
         self.packet_ready.emit(CapturePacket(now, observation, estimate, fps))
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        height, width, channels = rgb.shape
-        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
-        self.preview_ready.emit(image)
-        if not self._first_frame_logged:
-            LOGGER.info("camera_first_preview_emitted size=%sx%s", width, height)
-            self._first_frame_logged = True
+        if (
+            self._last_preview_at is None
+            or now - self._last_preview_at >= self.PREVIEW_INTERVAL_SECONDS
+        ):
+            self._last_preview_at = now
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            height, width, channels = rgb.shape
+            image = QImage(
+                rgb.data,
+                width,
+                height,
+                channels * width,
+                QImage.Format.Format_RGB888,
+            ).copy()
+            self.preview_ready.emit(image)
+            if not self._first_frame_logged:
+                LOGGER.info("camera_first_preview_emitted size=%sx%s", width, height)
+                self._first_frame_logged = True
 
     @pyqtSlot(object, object, object)
     def train_model(self, features, labels, metadata: CalibrationMetadata) -> None:
@@ -108,7 +123,7 @@ class CameraWorker(QObject):
             self.failed.emit(f"校准模型训练失败：{error}")
         finally:
             if self._timer is not None:
-                self._timer.start(0)
+                self._timer.start(self.FRAME_INTERVAL_MS)
 
     @pyqtSlot(object)
     def configure_metadata(self, metadata: CalibrationMetadata) -> None:
@@ -130,7 +145,7 @@ class CameraWorker(QObject):
             self.failed.emit(f"校准模型保存失败：{error}")
         finally:
             if self._timer is not None:
-                self._timer.start(0)
+                self._timer.start(self.FRAME_INTERVAL_MS)
 
     @pyqtSlot(object)
     def load_calibration(self, stored: StoredCalibration) -> None:
