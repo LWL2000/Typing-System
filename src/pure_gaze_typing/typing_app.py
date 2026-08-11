@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     app = QApplication.instance() or QApplication(["纯眼动打字器"])
     paths = AppPaths.default()
+    paths.migrate_legacy()
     configure_logging(paths, "typing")
     screen = app.primaryScreen()
     if screen is None:

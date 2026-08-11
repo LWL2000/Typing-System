@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     app = QApplication.instance() or QApplication(["眼动采集校准"])
     paths = AppPaths.default()
+    paths.migrate_legacy()
     configure_logging(paths, "capture")
     if args.self_test:
         model = find_face_model()
