@@ -12,7 +12,7 @@ from .paths import AppPaths
 from .protocol import GazeSample, Heartbeat, ProtocolMessage, UdpReceiver
 from .session_log import SessionRecorder
 from .settings import TypingSettings
-from .typing_engine import PageKind, TargetSpec, TypingEngine
+from .typing_engine import PageKind, TypingEngine
 
 
 @dataclass(frozen=True)
@@ -190,12 +190,11 @@ class TypingController(QObject):
 
         geometry_target = None
         if corrected is not None:
-            include_back = self.engine.page_kind is not PageKind.MAIN and not self.engine.paused
             geometry_target = hit_test(
                 self.layout,
                 corrected[0],
                 corrected[1],
-                include_back=include_back,
+                target_count=len(self.engine.targets()),
             )
         logical_target = self._logical_target(geometry_target)
         dwell_update = self.dwell.update(
@@ -217,8 +216,9 @@ class TypingController(QObject):
         return self.current_update()
 
     def current_update(self) -> ControllerUpdate:
-        labels = ["" for _ in range(6)]
-        for target in self.engine.targets():
+        targets = self.engine.targets()
+        labels = ["" for _ in range(len(targets))]
+        for target in targets:
             labels[target.position] = target.label
         return ControllerUpdate(
             self._status,
@@ -234,10 +234,7 @@ class TypingController(QObject):
         )
 
     def _new_dwell(self, settings: TypingSettings) -> DwellSelector:
-        return DwellSelector(
-            settings.dwell_seconds,
-            target_dwell_seconds={"back": max(settings.dwell_seconds, 1.2)},
-        )
+        return DwellSelector(settings.dwell_seconds)
 
     def _process_prepare(
         self,
@@ -259,8 +256,6 @@ class TypingController(QObject):
             self._message = ""
 
     def _logical_target(self, geometry_target: str | None) -> str | None:
-        if geometry_target == "back":
-            return "back"
         if geometry_target is None or not geometry_target.startswith("target_"):
             return None
         position = int(geometry_target.removeprefix("target_"))
@@ -271,16 +266,9 @@ class TypingController(QObject):
         self.last_triggered_target = logical_target
         self._last_dwell_target = None
         self._last_dwell_progress = 0.0
-        if logical_target == "back":
-            self.engine.return_to_main()
-            self._set_message("已返回主菜单")
-            self._record_event("gaze_return", {})
-            return
         effect = self.engine.activate(logical_target)
         self._record_event("selection", {"target_id": logical_target, "action": effect.action})
-        if effect.requires_clear_confirmation:
-            self._set_message("请再次凝视“清空”确认")
-        elif effect.sent_text is not None:
+        if effect.sent_text is not None:
             if self.recorder is None:
                 self._set_message("当前没有实验记录，无法发送")
                 return
@@ -291,10 +279,6 @@ class TypingController(QObject):
                 self.session_finished.emit(effect.sent_text)
             else:
                 self._set_message("文本保存失败，内容已保留")
-        elif effect.action == "pause":
-            self._set_message("已暂停，凝视“继续”恢复")
-        elif effect.action == "resume":
-            self._set_message("")
 
     def _record_gaze(self, sample: GazeSample, target_id: str | None, progress: float) -> None:
         if self.recorder is not None:

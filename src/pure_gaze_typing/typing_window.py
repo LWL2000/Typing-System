@@ -20,7 +20,6 @@ from .layout import build_layout
 from .paths import AppPaths
 from .settings import TypingSettings, save_settings
 from .typing_controller import ConnectionStatus, ControllerUpdate, TypingController
-from .typing_engine import PageKind
 
 
 class StartupWindow(QMainWindow):
@@ -113,7 +112,7 @@ class KeyboardCanvas(QWidget):
     def __init__(self, settings: TypingSettings) -> None:
         super().__init__()
         self.show_gaze_point = settings.show_gaze_point
-        self.target_labels: tuple[str, ...] = ("",) * 6
+        self.target_labels: tuple[str, ...] = ("",) * 8
         self.update_state: ControllerUpdate | None = None
         self.setMinimumSize(800, 600)
 
@@ -125,71 +124,67 @@ class KeyboardCanvas(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#f7f8fa"))
+        painter.fillRect(self.rect(), QColor("#000000"))
         layout = build_layout(max(1, self.width()), max(1, self.height()))
         update = self.update_state
         labels = self.target_labels
+        target_rects = layout.targets_for(len(labels))
         current_target = None if update is None else update.dwell_target_id
         progress = 0.0 if update is None else update.dwell_progress
 
-        painter.setPen(QColor("#17212b"))
-        painter.setFont(QFont("Microsoft YaHei", 16))
+        painter.setPen(QPen(QColor("#777777"), 2))
+        painter.setBrush(QColor("#000000"))
+        painter.drawRect(
+            round(layout.top_bar.left),
+            round(layout.top_bar.top),
+            round(layout.top_bar.width),
+            round(layout.top_bar.height),
+        )
+        painter.setPen(QColor("#f3f3f3"))
+        painter.setFont(QFont("Microsoft YaHei", 15))
         top_text = "" if update is None else update.current_text
         painter.drawText(
-            round(layout.top_bar.left + layout.back_target.width + 14),
+            round(layout.top_bar.left + 14),
             round(layout.top_bar.top),
-            round(layout.top_bar.width - layout.back_target.width - 28),
+            round(layout.top_bar.width - 28),
             round(layout.top_bar.height),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             top_text,
         )
-        show_back = update is not None and update.page_kind is not PageKind.MAIN and not update.preparing
-        if show_back:
-            back = layout.back_target
-            painter.setPen(QPen(QColor("#41505d"), 2))
-            painter.setBrush(QColor("#ffffff"))
-            painter.drawRect(round(back.left), round(back.top), round(back.width), round(back.height))
-            painter.drawText(
-                round(back.left), round(back.top), round(back.width), round(back.height),
-                Qt.AlignmentFlag.AlignCenter, "← 返回",
-            )
-            if current_target == "back":
-                painter.fillRect(
-                    round(back.left), round(back.bottom - 7), round(back.width * progress), 7,
-                    QColor("#2f7d62"),
-                )
 
-        painter.setFont(QFont("Microsoft YaHei", 24, QFont.Weight.DemiBold))
-        for index, rect in enumerate(layout.targets):
-            painter.setPen(QPen(QColor("#7f8b95"), 2))
-            painter.setBrush(QColor("#ffffff" if labels[index] else "#edf0f2"))
+        font_size = 24 if len(labels) == 8 else 28
+        painter.setFont(QFont("Microsoft YaHei", font_size, QFont.Weight.DemiBold))
+        for index, rect in enumerate(target_rects):
+            active = current_target == f"target_{index}"
+            painter.setPen(QPen(QColor("#ff1717" if active else "#a8a8a8"), 6 if active else 1))
+            painter.setBrush(QColor("#858585" if labels[index] else "#111111"))
             painter.drawRect(round(rect.left), round(rect.top), round(rect.width), round(rect.height))
-            painter.setPen(QColor("#17212b"))
+            painter.setPen(QColor("#ffffff"))
             painter.drawText(
                 round(rect.left), round(rect.top), round(rect.width), round(rect.height),
                 Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
                 labels[index],
             )
-            if current_target == f"target_{index}":
+            if active:
                 painter.fillRect(
                     round(rect.left), round(rect.bottom - 9), round(rect.width * progress), 9,
-                    QColor("#2f7d62"),
+                    QColor("#ff1717"),
                 )
 
         if update is not None and update.preparing:
-            painter.setBrush(QColor("#1f6f5a"))
+            painter.setBrush(QColor("#2f8c70"))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(self.width() // 2 - 18, self.height() // 2 - 18, 36, 36)
-            painter.setPen(QColor("#17212b"))
+            painter.setPen(QColor("#f3f3f3"))
             painter.setFont(QFont("Microsoft YaHei", 18))
             painter.drawText(0, self.height() // 2 + 42, self.width(), 40, Qt.AlignmentFlag.AlignCenter, "请注视中心")
 
         if update is not None and update.message:
-            painter.setPen(QColor("#9c3f2f"))
+            painter.setPen(QColor("#ff5a4f"))
             painter.setFont(QFont("Microsoft YaHei", 15))
             painter.drawText(0, self.height() - 48, self.width(), 32, Qt.AlignmentFlag.AlignCenter, update.message)
         if update is not None and update.blink_count:
-            painter.setPen(QColor("#925f17"))
+            painter.setPen(QColor("#f0b34f"))
             painter.drawText(self.width() - 170, 24, 150, 30, Qt.AlignmentFlag.AlignRight, f"眨眼 {update.blink_count}/3")
         if (
             update is not None
@@ -199,7 +194,7 @@ class KeyboardCanvas(QWidget):
         ):
             x, y = update.gaze_point
             painter.setPen(QPen(QColor("#ffffff"), 2))
-            painter.setBrush(QColor("#d53f3f"))
+            painter.setBrush(QColor("#e23b3b"))
             painter.drawEllipse(round(x - 8), round(y - 8), 16, 16)
 
 

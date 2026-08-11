@@ -90,6 +90,8 @@ class CalibrationMetadata:
     screen_affine: tuple[tuple[float, float], ...] = ()
     validation_hits: int | None = None
     validation_total: int | None = None
+    validation_median_error_px: float | None = None
+    validation_max_error_px: float | None = None
 
     def __post_init__(self) -> None:
         if not self.calibration_id:
@@ -101,6 +103,9 @@ class CalibrationMetadata:
             raise ValueError("feature range threshold must be positive")
         if self.screen_affine and (len(self.screen_affine) != 3 or any(len(row) != 2 for row in self.screen_affine)):
             raise ValueError("screen affine coefficients must be 3x2")
+        for value in (self.validation_median_error_px, self.validation_max_error_px):
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError("validation errors must be non-negative and finite")
 
 
 @dataclass(frozen=True)
@@ -293,6 +298,26 @@ def filter_stable_features(
     return values[keep]
 
 
+def stable_median_prediction(
+    predictions: Sequence[object] | np.ndarray,
+    *,
+    min_samples: int = 8,
+    max_samples: int = 20,
+) -> tuple[float, float]:
+    values = np.asarray(predictions, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 2:
+        raise ValueError("predictions must be an Nx2 array")
+    finite = values[np.all(np.isfinite(values), axis=1)]
+    if finite.shape[0] < min_samples:
+        raise RuntimeError(f"at least {min_samples} valid prediction samples are required")
+    stable = filter_stable_features(
+        finite,
+        min_samples=min_samples,
+        max_samples=max_samples,
+    )
+    return tuple(map(float, np.median(stable, axis=0)))
+
+
 def balance_point_samples(
     groups: Sequence[tuple[tuple[float, float], np.ndarray]],
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -432,4 +457,6 @@ class CalibrationStore:
             screen_affine=tuple(tuple(row) for row in payload.get("screen_affine", ())),
             validation_hits=payload.get("validation_hits"),
             validation_total=payload.get("validation_total"),
+            validation_median_error_px=payload.get("validation_median_error_px"),
+            validation_max_error_px=payload.get("validation_max_error_px"),
         )

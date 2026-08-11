@@ -40,7 +40,9 @@ def main(argv: list[str] | None = None) -> int:
         if not model.is_file() or model.stat().st_size <= 0:
             logging.getLogger("pure_gaze_typing").error("FaceLandmarker 模型缺失：%s", model)
             return 2
-        assert len(build_layout(1920, 1080).targets) == 6
+        layout = build_layout(1920, 1080)
+        assert len(layout.main_targets) == 8
+        assert len(layout.submenu_targets) == 6
         heartbeat = Heartbeat(1.0, True, True, "self-test", LAYOUT_VERSION, 30.0)
         assert decode_message(encode_message(heartbeat)) == heartbeat
         return 0

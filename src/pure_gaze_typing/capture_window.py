@@ -35,6 +35,7 @@ from .calibration import (
     calibration_profile,
     fit_screen_affine,
     score_validation,
+    stable_median_prediction,
 )
 from .capture_worker import CameraWorker, CapturePacket
 from .eyetrax_runtime import EyeTraxRuntime
@@ -44,6 +45,7 @@ from .layout import (
     calibration_points,
     hit_test,
     uniform_grid_calibration_points,
+    validation_points,
 )
 from .paths import AppPaths
 from .protocol import GazeSample, Heartbeat, UdpPublisher
@@ -103,6 +105,7 @@ class CaptureController(QObject):
         self._validation_index: int | None = None
         self._validation_started_at: float | None = None
         self._validation_hits: dict[str, int] = {}
+        self._validation_errors: dict[str, float] = {}
         self._failed_targets: tuple[str, ...] = ()
         self._heartbeat = QTimer(self)
         self._heartbeat.setInterval(1000)
@@ -168,7 +171,8 @@ class CaptureController(QObject):
         self._streaming = False
         self._base_training = None
         self._provisional_metadata = None
-        self._validation_hits = {f"target_{index}": 0 for index in range(6)}
+        self._validation_hits = {f"validation_{index}": 0 for index in range(6)}
+        self._validation_errors = {}
         self._failed_targets = ()
         layout = build_layout(self.environment.screen_width, self.environment.screen_height)
         duration = self._profile.settle_seconds + self._profile.capture_seconds
@@ -211,7 +215,7 @@ class CaptureController(QObject):
         self._calibration_active = True
         self._retrying = True
         layout = build_layout(self.environment.screen_width, self.environment.screen_height)
-        point_map = dict(calibration_points(layout))
+        point_map = dict((*calibration_points(layout), *validation_points(layout)))
         duration = self._profile.settle_seconds + self._profile.capture_seconds
         points = tuple(
             CalibrationPoint(target_id, *point_map[target_id], duration)
@@ -253,7 +257,7 @@ class CaptureController(QObject):
     def stop_streaming(self) -> None:
         self._streaming = False
         LOGGER.info("stream_stopped")
-        self.stream_state_changed.emit(False, "眼动数据输出已停止")
+        self.stream_state_changed.emit(False, "眼动输出已暂停（摄像头预览继续）")
 
     def stop_camera(self) -> None:
         if self.worker is not None and self.thread is not None:
@@ -388,7 +392,7 @@ class CaptureController(QObject):
             self._prediction_samples.append((estimate.raw_x, estimate.raw_y))
         if elapsed < settle + capture:
             return
-        if len(self._prediction_samples) < 3:
+        if len(self._prediction_samples) < 8:
             target_id = self._prediction_target_ids[self._prediction_index]
             self._prediction_stage = None
             self._calibration_active = False
@@ -396,8 +400,10 @@ class CaptureController(QObject):
             return
 
         target_id = self._prediction_target_ids[self._prediction_index]
-        median_prediction = tuple(
-            map(float, np.median(np.asarray(self._prediction_samples, dtype=float), axis=0))
+        median_prediction = stable_median_prediction(
+            self._prediction_samples,
+            min_samples=8,
+            max_samples=20,
         )
         if self._prediction_stage == "bias":
             self._bias_predictions[target_id] = median_prediction
@@ -422,7 +428,7 @@ class CaptureController(QObject):
     def _point_map(self) -> dict[str, tuple[float, float]]:
         assert self.environment is not None
         layout = build_layout(self.environment.screen_width, self.environment.screen_height)
-        return dict(calibration_points(layout))
+        return dict((*calibration_points(layout), *validation_points(layout)))
 
     def _finish_bias_correction(self) -> None:
         assert self._provisional_metadata is not None
@@ -452,7 +458,7 @@ class CaptureController(QObject):
         self._after_configure = None
         if action == "validate":
             target_ids = self._failed_targets if self._retrying else tuple(
-                f"target_{index}" for index in range(6)
+                f"validation_{index}" for index in range(6)
             )
             self._start_prediction_stage("validation", target_ids)
         elif action == "save":
@@ -470,20 +476,34 @@ class CaptureController(QObject):
             raw_prediction[1],
         )
         layout = build_layout(self.environment.screen_width, self.environment.screen_height)
+        expected = dict(validation_points(layout))[target_id]
+        self._validation_errors[target_id] = float(np.hypot(
+            corrected[0] - expected[0],
+            corrected[1] - expected[1],
+        ))
         self._validation_hits[target_id] = int(
-            hit_test(layout, corrected[0], corrected[1], include_back=False) == target_id
+            hit_test(layout, corrected[0], corrected[1], target_count=6)
+            == target_id.replace("validation_", "target_")
         )
 
     def _finish_validation(self) -> None:
         result = score_validation(self._validation_hits, min_hits_per_target=1)
         self._failed_targets = result.failed_target_ids
-        message = f"命中 {result.hit_count}/{result.total_count}"
+        errors = tuple(self._validation_errors.values())
+        median_error = None if not errors else float(np.median(errors))
+        max_error = None if not errors else float(np.max(errors))
+        detail = "" if median_error is None else (
+            f"，中位误差 {median_error:.0f}px，最大误差 {max_error:.0f}px"
+        )
+        message = f"命中 {result.hit_count}/{result.total_count}{detail}"
         if result.passed:
             assert self._provisional_metadata is not None
             self._provisional_metadata = replace(
                 self._provisional_metadata,
                 validation_hits=result.hit_count,
                 validation_total=result.total_count,
+                validation_median_error_px=median_error,
+                validation_max_error_px=max_error,
             )
             self._save_requested.emit(self._provisional_metadata)
             return
@@ -611,6 +631,8 @@ class CaptureWindow(QMainWindow):
         self._calibration_mode = False
         self._highlight_id: str | None = None
         self.mode_dialog: CalibrationModeDialog | None = None
+        self._last_preview_at = 0.0
+        self._closing = False
         self.setWindowTitle("眼动采集校准")
         self.setMinimumSize(920, 640)
         self.setStyleSheet(
@@ -643,11 +665,11 @@ class CaptureWindow(QMainWindow):
         root.addWidget(self.preview_label, 1)
 
         options = QHBoxLayout()
-        self.validation_checkbox = QCheckBox("校准后进行精度验证")
-        self.calibrate_button = QPushButton("快速校准")
+        self.validation_checkbox = QCheckBox("校准后进行精度验证（推荐）")
+        self.calibrate_button = QPushButton("重新校准…")
         self.calibrate_button.setEnabled(False)
-        self.stream_button = QPushButton("开始输出")
-        self.stop_stream_button = QPushButton("停止输出")
+        self.stream_button = QPushButton("恢复输出")
+        self.stop_stream_button = QPushButton("暂停输出")
         self.stream_button.setEnabled(False)
         self.stop_stream_button.setEnabled(False)
         self.retry_failed_button = QPushButton("重校异常区域")
@@ -665,6 +687,9 @@ class CaptureWindow(QMainWindow):
             options.addWidget(widget)
         root.addLayout(options)
         self.result_label = QLabel("请选择摄像头并完成快速校准")
+        self.result_label.setStyleSheet(
+            "padding:10px 12px;background:#ffffff;border:1px solid #aab5bd;font-weight:600;"
+        )
         root.addWidget(self.result_label)
 
         self.connect_button.clicked.connect(
@@ -682,10 +707,13 @@ class CaptureWindow(QMainWindow):
         controller.preview_ready.connect(self._on_preview)
 
     def _begin_calibration(self) -> None:
+        self.result_label.setText("请选择校准方式")
         self.mode_dialog = CalibrationModeDialog(self)
         self.mode_dialog.mode_selected.connect(self._start_selected_calibration)
         self.mode_dialog.rejected.connect(self._cancel_mode_choice)
         self.mode_dialog.showFullScreen()
+        self.mode_dialog.raise_()
+        self.mode_dialog.activateWindow()
 
     def _start_selected_calibration(self, mode: CalibrationMode) -> None:
         self._calibration_mode = True
@@ -710,6 +738,7 @@ class CaptureWindow(QMainWindow):
             return None
         layout = build_layout(max(1, self.width()), max(1, self.height()))
         point_map = dict(calibration_points(layout))
+        point_map.update(validation_points(layout))
         point_map.update(uniform_grid_calibration_points(layout))
         point_map["pose_center"] = (layout.screen_width / 2.0, layout.screen_height / 2.0)
         return point_map.get(self._highlight_id)
@@ -722,10 +751,13 @@ class CaptureWindow(QMainWindow):
         painter.fillRect(self.rect(), QColor("#f7f8fa"))
         layout = build_layout(self.width(), self.height())
         painter.setPen(QPen(QColor("#a6b0b8"), 2))
-        for rect in layout.targets:
+        target_rects = (
+            layout.submenu_targets
+            if self._highlight_id and self._highlight_id.startswith("validation_")
+            else layout.main_targets
+        )
+        for rect in target_rects:
             painter.drawRect(round(rect.left), round(rect.top), round(rect.width), round(rect.height))
-        back = layout.back_target
-        painter.drawRect(round(back.left), round(back.top), round(back.width), round(back.height))
         center = self.highlight_center()
         if center is not None:
             painter.setBrush(QColor("#2f7d62"))
@@ -752,6 +784,7 @@ class CaptureWindow(QMainWindow):
     def _on_camera_state(self, ready: bool, message: str) -> None:
         self.camera_status_label.setText(message)
         self.calibrate_button.setEnabled(ready)
+        self.connect_button.setText("重新连接" if ready else "连接摄像头")
 
     def _on_calibration_finished(self, passed: bool, message: str, failed_targets) -> None:
         self.result_label.setText(message)
@@ -768,8 +801,13 @@ class CaptureWindow(QMainWindow):
         self.result_label.setText(message)
         self.stream_button.setEnabled(not running)
         self.stop_stream_button.setEnabled(running)
+        self.stream_button.setText("已在自动输出" if running else "恢复输出")
 
     def _on_preview(self, image: QImage) -> None:
+        now = time.monotonic()
+        if now - self._last_preview_at < 1.0 / 15.0:
+            return
+        self._last_preview_at = now
         pixmap = QPixmap.fromImage(image)
         self.preview_label.setPixmap(
             pixmap.scaled(
@@ -787,5 +825,11 @@ class CaptureWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closing:
+            event.accept()
+            return
+        self._closing = True
+        if self.mode_dialog is not None:
+            self.mode_dialog.close()
         self.controller.stop()
         event.accept()

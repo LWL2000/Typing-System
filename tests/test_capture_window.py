@@ -5,7 +5,7 @@ import pytest
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 
 import pure_gaze_typing.capture_window as capture_module
-from pure_gaze_typing.calibration import CalibrationEnvironment
+from pure_gaze_typing.calibration import CalibrationEnvironment, stable_median_prediction
 from pure_gaze_typing.calibration import CalibrationMetadata, CalibrationMode
 from pure_gaze_typing.capture_worker import CameraWorker
 from pure_gaze_typing.capture_window import CaptureController, CaptureWindow
@@ -24,6 +24,7 @@ class FakeCaptureController(QObject):
         super().__init__()
         self.calibration_calls = []
         self.cancel_calls = 0
+        self.stop_calls = 0
 
     def start_camera(self, _index):
         return None
@@ -47,7 +48,7 @@ class FakeCaptureController(QObject):
         return None
 
     def stop(self):
-        return None
+        self.stop_calls += 1
 
 
 class FakePublisher:
@@ -110,6 +111,41 @@ def test_validation_is_off_by_default_and_calibration_button_tracks_camera(qtbot
     controller.stream_state_changed.emit(True, "眼动数据正在输出")
     assert not window.stream_button.isEnabled()
     assert window.stop_stream_button.isEnabled()
+    assert window.stop_stream_button.text() == "暂停输出"
+
+
+def test_pause_output_has_visible_feedback_even_while_preview_continues(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+
+    controller.stream_state_changed.emit(False, "眼动输出已暂停（摄像头预览继续）")
+
+    assert "预览继续" in window.result_label.text()
+    assert window.stream_button.text() == "恢复输出"
+
+
+def test_window_close_stops_controller_and_closes_immediately(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+
+    window.close()
+
+    assert controller.stop_calls == 1
+    assert not window.isVisible()
+
+
+def test_prediction_summary_rejects_outlier_and_requires_eight_samples():
+    samples = [(500.0 + index, 300.0 - index) for index in range(10)]
+    samples.append((5000.0, -4000.0))
+
+    prediction = stable_median_prediction(samples, min_samples=8, max_samples=20)
+
+    assert prediction == pytest.approx((504.5, 295.5), abs=1.0)
+    with pytest.raises(RuntimeError, match="at least 8"):
+        stable_median_prediction(samples[:7], min_samples=8, max_samples=20)
 
 
 def test_loaded_calibration_starts_output_when_camera_becomes_ready(tmp_path: Path):

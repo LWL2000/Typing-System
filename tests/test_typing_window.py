@@ -68,7 +68,7 @@ def make_controller(root: Path, show_gaze_point: bool) -> TypingController:
         0.0,
     )
     for index in range(5):
-        controller.process_message(valid_sample(index * 0.05, 326.4, 356.4), index * 0.05)
+        controller.process_message(valid_sample(index * 0.05, 268.8, 248.4), index * 0.05)
     return controller
 
 
@@ -115,10 +115,10 @@ def test_hidden_gaze_point_does_not_change_selection(tmp_path: Path):
     visible = make_controller(tmp_path / "visible", True)
     hidden = make_controller(tmp_path / "hidden", False)
     for timestamp in (0.7, 1.2):
-        sample = valid_sample(timestamp, 326.4, 356.4)
+        sample = valid_sample(timestamp, 268.8, 248.4)
         visible.process_message(sample, timestamp)
         hidden.process_message(sample, timestamp)
-    assert visible.engine.page_kind == hidden.engine.page_kind == PageKind.LETTERS
+    assert visible.engine.page_kind == hidden.engine.page_kind == PageKind.SUBMENU
     assert visible.last_triggered_target == hidden.last_triggered_target == "main_group_0"
 
 
