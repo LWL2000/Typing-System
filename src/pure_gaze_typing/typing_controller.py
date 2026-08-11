@@ -20,6 +20,7 @@ class ConnectionStatus:
     online: bool
     calibration_compatible: bool
     message: str
+    gaze_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ class TypingController(QObject):
         self._status = ConnectionStatus(False, False, "等待眼动采集程序")
         self._expected_calibration_id = ""
         self._last_message_at: float | None = None
+        self._last_valid_gaze_at: float | None = None
         self._last_gaze_point: tuple[float, float] | None = None
         self._last_dwell_target: str | None = None
         self._last_dwell_progress = 0.0
@@ -125,13 +127,20 @@ class TypingController(QObject):
         self._last_message_at = current
         if isinstance(message, Heartbeat):
             compatible = message.calibration_ready and message.layout_version == self.layout.version
+            if message.calibration_id != self._expected_calibration_id:
+                self._last_valid_gaze_at = None
             self._expected_calibration_id = message.calibration_id if compatible else ""
             if not message.camera_ok:
                 self._disconnect("摄像头未就绪")
             elif not compatible:
-                self._set_status(False, False, "校准不可用或界面尺寸不匹配")
+                self._set_status(False, False, "校准不可用或界面尺寸不匹配", False)
             else:
-                self._set_status(True, True, "眼动采集已连接")
+                gaze_ready = (
+                    self._last_valid_gaze_at is not None
+                    and current - self._last_valid_gaze_at <= 2.0
+                )
+                status_message = "眼动数据已就绪" if gaze_ready else "采集端已连接，等待有效眼动数据"
+                self._set_status(True, True, status_message, gaze_ready)
             return self.current_update()
 
         compatible = (
@@ -140,9 +149,14 @@ class TypingController(QObject):
             and message.layout_version == self.layout.version
         )
         if not compatible:
-            self._set_status(False, False, "眼动校准标识不匹配")
+            self._last_valid_gaze_at = None
+            self._set_status(False, False, "眼动校准标识不匹配", False)
             self.dwell.reset()
             return self.current_update()
+
+        if message.valid and message.screen_x is not None and message.screen_y is not None:
+            self._last_valid_gaze_at = current
+            self._set_status(True, True, "眼动数据已就绪", True)
 
         blink_update = self.blinks.update(
             current,
@@ -293,12 +307,13 @@ class TypingController(QObject):
     def _disconnect(self, message: str) -> None:
         self.dwell.reset()
         self.blinks.reset()
+        self._last_valid_gaze_at = None
         self._last_dwell_target = None
         self._last_dwell_progress = 0.0
-        self._set_status(False, self._status.calibration_compatible, message)
+        self._set_status(False, self._status.calibration_compatible, message, False)
 
-    def _set_status(self, online: bool, compatible: bool, message: str) -> None:
-        status = ConnectionStatus(online, compatible, message)
+    def _set_status(self, online: bool, compatible: bool, message: str, gaze_ready: bool = False) -> None:
+        status = ConnectionStatus(online, compatible, message, gaze_ready)
         if status != self._status:
             self._status = status
             self.status_changed.emit(status)

@@ -85,7 +85,9 @@ class StartupWindow(QMainWindow):
 
     def _on_status(self, status: ConnectionStatus) -> None:
         self.status_label.setText(status.message)
-        self.start_button.setEnabled(status.online and status.calibration_compatible)
+        self.start_button.setEnabled(
+            status.online and status.calibration_compatible and status.gaze_ready
+        )
 
     def _start(self) -> None:
         self._connection_timer.stop()

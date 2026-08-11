@@ -88,6 +88,27 @@ def test_compatible_heartbeat_marks_capture_online_without_valid_gaze(tmp_path: 
 
     assert controller.status.online
     assert controller.status.calibration_compatible
+    assert not controller.status.gaze_ready
+    assert "等待有效眼动数据" in controller.status.message
+
+
+def test_valid_gaze_marks_stream_ready(tmp_path: Path):
+    controller = TypingController(
+        AppPaths.for_root(tmp_path),
+        TypingSettings(),
+        1920,
+        1080,
+        receiver=FakeReceiver(),
+    )
+    controller.process_message(
+        Heartbeat(0.0, True, True, "cal-1", LAYOUT_VERSION, 30.0),
+        0.0,
+    )
+
+    controller.process_message(valid_sample(0.1, 960.0, 540.0), 0.1)
+
+    assert controller.status.gaze_ready
+    assert controller.status.message == "眼动数据已就绪"
 
 
 def test_hidden_gaze_point_does_not_change_selection(tmp_path: Path):
@@ -114,12 +135,14 @@ def test_center_prepare_waits_for_initial_eye_movement(tmp_path: Path):
     controller.end_session()
 
 
-def test_start_button_requires_online_compatible_calibration(qtbot, tmp_path: Path):
+def test_start_button_requires_live_gaze_in_addition_to_compatible_calibration(qtbot, tmp_path: Path):
     controller = FakeTypingController()
     window = StartupWindow(controller, TypingSettings(), AppPaths.for_root(tmp_path))
     qtbot.addWidget(window)
     assert not window.start_button.isEnabled()
-    controller.status_changed.emit(ConnectionStatus(True, True, "眼动已连接"))
+    controller.status_changed.emit(ConnectionStatus(True, True, "等待有效眼动数据"))
+    assert not window.start_button.isEnabled()
+    controller.status_changed.emit(ConnectionStatus(True, True, "眼动数据已就绪", True))
     assert window.start_button.isEnabled()
     assert window.gaze_checkbox.isChecked()
     assert window.dwell_spin.value() == 1.0
@@ -133,7 +156,7 @@ def test_startup_window_polls_for_udp_before_session_starts(qtbot, tmp_path: Pat
 
         def tick(self, _now):
             self.tick_count += 1
-            self.status_changed.emit(ConnectionStatus(True, True, "connected"))
+            self.status_changed.emit(ConnectionStatus(True, True, "connected", True))
 
     controller = PollingController()
     window = StartupWindow(controller, TypingSettings(), AppPaths.for_root(tmp_path))

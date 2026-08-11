@@ -241,14 +241,18 @@ class CaptureController(QObject):
         self.calibration_finished.emit(False, "校准已取消", ())
 
     def start_streaming(self) -> None:
+        LOGGER.info("stream_start_requested")
         if self.worker is None or self.runtime is None or self.runtime.metadata is None:
+            LOGGER.warning("stream_start_rejected calibration_ready=%s", bool(self.runtime and self.runtime.metadata))
             self.stream_state_changed.emit(False, "请先完成校准")
             return
         self._streaming = True
+        LOGGER.info("stream_started calibration_id=%s", self.runtime.metadata.calibration_id)
         self.stream_state_changed.emit(True, "眼动数据正在输出")
 
     def stop_streaming(self) -> None:
         self._streaming = False
+        LOGGER.info("stream_stopped")
         self.stream_state_changed.emit(False, "眼动数据输出已停止")
 
     def stop_camera(self) -> None:
@@ -272,6 +276,7 @@ class CaptureController(QObject):
         self.thread = None
         self.runtime = None
         self._camera_ready = False
+        self._streaming = False
 
     def stop(self) -> None:
         self._heartbeat.stop()
@@ -281,7 +286,11 @@ class CaptureController(QObject):
 
     def _on_camera_state(self, ready: bool, message: str) -> None:
         self._camera_ready = ready
+        LOGGER.info("camera_state_changed ready=%s message=%s", ready, message)
         self.camera_state_changed.emit(ready, message)
+        if ready and self.runtime is not None and self.runtime.metadata is not None:
+            LOGGER.info("stream_auto_start source=loaded_calibration")
+            self.start_streaming()
 
     def _on_worker_failure(self, message: str) -> None:
         self.camera_state_changed.emit(False, message)
@@ -495,6 +504,8 @@ class CaptureController(QObject):
         else:
             message = f"{mode_name}已保存"
         self.calibration_finished.emit(True, message, ())
+        LOGGER.info("stream_auto_start source=saved_calibration")
+        self.start_streaming()
 
     def _publish_estimate(self, packet: CapturePacket) -> None:
         assert self.runtime is not None and self.runtime.metadata is not None
@@ -637,6 +648,8 @@ class CaptureWindow(QMainWindow):
         self.calibrate_button.setEnabled(False)
         self.stream_button = QPushButton("开始输出")
         self.stop_stream_button = QPushButton("停止输出")
+        self.stream_button.setEnabled(False)
+        self.stop_stream_button.setEnabled(False)
         self.retry_failed_button = QPushButton("重校异常区域")
         self.save_anyway_button = QPushButton("仍然保存")
         self.retry_failed_button.hide()

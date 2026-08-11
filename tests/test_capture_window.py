@@ -76,6 +76,14 @@ class ProvisionalRuntime:
         Path(path).write_bytes(b"provisional-model")
 
 
+class ReadyRuntime:
+    def __init__(self, metadata):
+        self.metadata = metadata
+
+    def close(self):
+        return None
+
+
 class RecordingStore:
     def __init__(self, root: Path):
         self.saved = []
@@ -94,9 +102,41 @@ def test_validation_is_off_by_default_and_calibration_button_tracks_camera(qtbot
     qtbot.addWidget(window)
     assert not window.validation_checkbox.isChecked()
     assert not window.calibrate_button.isEnabled()
+    assert not window.stream_button.isEnabled()
+    assert not window.stop_stream_button.isEnabled()
     controller.camera_state_changed.emit(True, "摄像头 0 已连接")
     assert window.calibrate_button.isEnabled()
     assert window.camera_status_label.text() == "摄像头 0 已连接"
+    controller.stream_state_changed.emit(True, "眼动数据正在输出")
+    assert not window.stream_button.isEnabled()
+    assert window.stop_stream_button.isEnabled()
+
+
+def test_loaded_calibration_starts_output_when_camera_becomes_ready(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda index: CalibrationEnvironment(1920, 1080, 1.0, index, "gaze-grid-v3-reference"),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    metadata = CalibrationMetadata(
+        "cal-loaded",
+        "2026-08-11T12:00:00+08:00",
+        CalibrationEnvironment(1920, 1080, 1.0, 0, "gaze-grid-v3-reference"),
+        (0.0, 0.0),
+        (2.0, 2.0),
+    )
+    controller.worker = object()
+    controller.runtime = ReadyRuntime(metadata)
+    states = []
+    controller.stream_state_changed.connect(lambda running, message: states.append((running, message)))
+
+    controller._on_camera_state(True, "摄像头 0 已连接")
+
+    assert controller._streaming
+    assert states[-1] == (True, "眼动数据正在输出")
+    controller.worker = None
+    controller.stop()
 
 
 def test_calibration_scene_uses_shared_layout_centers(qtbot, tmp_path: Path):
@@ -270,6 +310,34 @@ def test_validation_gate_promotes_at_five_of_six(tmp_path: Path):
     assert len(promoted) == 1
     assert promoted[0].validation_hits == 5
     assert promoted[0].validation_total == 6
+    controller.stop()
+
+
+def test_saved_calibration_automatically_resumes_output(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda index: CalibrationEnvironment(1920, 1080, 1.0, index, "gaze-grid-v3-reference"),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    metadata = CalibrationMetadata(
+        "cal-saved",
+        "2026-08-11T12:00:00+08:00",
+        CalibrationEnvironment(1920, 1080, 1.0, 0, "gaze-grid-v3-reference"),
+        (0.0, 0.0),
+        (2.0, 2.0),
+    )
+    controller.worker = object()
+    controller.runtime = ReadyRuntime(metadata)
+    controller._calibration_active = True
+    states = []
+    controller.stream_state_changed.connect(lambda running, message: states.append((running, message)))
+
+    controller._on_model_saved(object())
+
+    assert controller._streaming
+    assert states[-1] == (True, "眼动数据正在输出")
+    controller.worker = None
     controller.stop()
 
 
