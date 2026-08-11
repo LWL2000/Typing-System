@@ -22,18 +22,19 @@ def test_fast_session_advances_after_duration_and_minimum_frames():
         (CalibrationPoint("target_0", 100.0, 200.0, 0.8),),
         min_valid_frames=12,
     )
-    for index in range(11):
+    for index in range(24):
         session.add_frame(
-            index * 0.08,
+            index / 30.0,
             np.array([index], dtype=float),
             blink=False,
             face_detected=True,
         )
     assert session.current_point_id == "target_0"
-    session.add_frame(0.88, np.array([12.0]), blink=False, face_detected=True)
+    session.add_frame(0.8, np.array([24.0]), blink=False, face_detected=True)
     assert session.complete
     features, labels = session.training_data()
-    assert features.shape == (12, 1)
+    assert features.shape == (17, 1)
+    assert features[0, 0] == 8.0
     assert np.all(labels == np.array([100.0, 200.0]))
 
 

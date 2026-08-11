@@ -2,6 +2,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from pure_gaze_typing.layout import LAYOUT_VERSION
 from pure_gaze_typing.paths import AppPaths
 from pure_gaze_typing.protocol import GazeSample, Heartbeat
 from pure_gaze_typing.settings import TypingSettings
@@ -48,7 +49,7 @@ def valid_sample(timestamp: float, x: float, y: float, *, blink: bool = False) -
         0.9 if not blink else 0.0,
         30.0,
         "cal-1",
-        "gaze-grid-v1",
+        LAYOUT_VERSION,
         x if not blink else None,
         y if not blink else None,
     )
@@ -63,7 +64,7 @@ def make_controller(root: Path, show_gaze_point: bool) -> TypingController:
         receiver=FakeReceiver(),
     )
     controller.process_message(
-        Heartbeat(0.0, True, True, "cal-1", "gaze-grid-v1", 30.0),
+        Heartbeat(0.0, True, True, "cal-1", LAYOUT_VERSION, 30.0),
         0.0,
     )
     for index in range(5):
@@ -81,7 +82,7 @@ def test_compatible_heartbeat_marks_capture_online_without_valid_gaze(tmp_path: 
     )
 
     controller.process_message(
-        Heartbeat(0.0, True, True, "cal-1", "gaze-grid-v1", 30.0),
+        Heartbeat(0.0, True, True, "cal-1", LAYOUT_VERSION, 30.0),
         0.0,
     )
 
@@ -98,6 +99,19 @@ def test_hidden_gaze_point_does_not_change_selection(tmp_path: Path):
         hidden.process_message(sample, timestamp)
     assert visible.engine.page_kind == hidden.engine.page_kind == PageKind.LETTERS
     assert visible.last_triggered_target == hidden.last_triggered_target == "main_group_0"
+
+
+def test_center_prepare_waits_for_initial_eye_movement(tmp_path: Path):
+    controller = make_controller(tmp_path, True)
+    controller.start_session()
+    for offset in (0.0, 0.1, 0.2):
+        controller.process_message(
+            valid_sample(1.0 + offset, 100.0, 100.0),
+            1.0 + offset,
+        )
+
+    assert controller.drift._points == []
+    controller.end_session()
 
 
 def test_start_button_requires_online_compatible_calibration(qtbot, tmp_path: Path):

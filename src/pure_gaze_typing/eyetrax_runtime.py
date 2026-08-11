@@ -102,7 +102,7 @@ class EyeTraxRuntime:
             LOGGER.info("eyetrax_import_smoother_begin")
             from eyetrax.filters import KalmanEMASmoother
 
-            smoother_factory = KalmanEMASmoother
+            smoother_factory = lambda: KalmanEMASmoother(ema_alpha=0.9)
             LOGGER.info("eyetrax_import_smoother_complete")
         LOGGER.info("eyetrax_estimator_create_begin model=%s", face_model_path)
         if estimator_factory is None:
@@ -151,6 +151,17 @@ class EyeTraxRuntime:
             dtype=float,
         ).reshape(-1, 2)[0]
         raw_x, raw_y = map(float, prediction)
+        margin_x = self.screen_width * 0.1
+        margin_y = self.screen_height * 0.1
+        if (
+            not np.isfinite(raw_x)
+            or not np.isfinite(raw_y)
+            or raw_x < -margin_x
+            or raw_x > self.screen_width - 1 + margin_x
+            or raw_y < -margin_y
+            or raw_y > self.screen_height - 1 + margin_y
+        ):
+            return GazeEstimate(False, True, False, quality)
         smooth_x, smooth_y = self._smoother.step(round(raw_x), round(raw_y))
         screen_x = min(max(float(smooth_x), 0.0), float(self.screen_width - 1))
         screen_y = min(max(float(smooth_y), 0.0), float(self.screen_height - 1))
@@ -203,8 +214,8 @@ class CenterDriftCorrector:
         screen_width: int,
         screen_height: int,
         *,
-        max_x_ratio: float = 0.08,
-        max_y_ratio: float = 0.05,
+        max_x_ratio: float = 0.12,
+        max_y_ratio: float = 0.15,
     ) -> None:
         self._max_x = float(screen_width) * max_x_ratio
         self._max_y = float(screen_height) * max_y_ratio

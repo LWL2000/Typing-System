@@ -74,7 +74,7 @@ def test_blink_frame_is_invalid_and_never_predicted():
 
 
 def test_in_range_prediction_is_smoothed_and_clamped():
-    estimator = FakeEstimator(features=np.array([1.0, 1.0]), prediction=(2000.0, -10.0))
+    estimator = FakeEstimator(features=np.array([1.0, 1.0]), prediction=(1950.0, -10.0))
     runtime = EyeTraxRuntime(
         Path("face.task"),
         1920,
@@ -87,6 +87,35 @@ def test_in_range_prediction_is_smoothed_and_clamped():
     assert estimate.valid
     assert estimate.quality == 1.0
     assert (estimate.screen_x, estimate.screen_y) == (1919.0, 0.0)
+
+
+def test_extreme_offscreen_prediction_is_rejected():
+    estimator = FakeEstimator(features=np.array([1.0, 1.0]), prediction=(-500.0, 500.0))
+    runtime = EyeTraxRuntime(
+        Path("face.task"),
+        1920,
+        1080,
+        estimator_factory=lambda **_kwargs: estimator,
+        smoother_factory=IdentitySmoother,
+    )
+    runtime.set_metadata(make_metadata())
+
+    estimate = runtime.process_frame(np.zeros((2, 2, 3), dtype=np.uint8))
+
+    assert not estimate.valid
+    assert estimate.face_detected
+
+
+def test_default_runtime_uses_strong_ema_smoothing():
+    estimator = FakeEstimator(features=np.array([1.0, 1.0]))
+    runtime = EyeTraxRuntime(
+        Path("face.task"),
+        1920,
+        1080,
+        estimator_factory=lambda **_kwargs: estimator,
+    )
+
+    assert runtime._smoother.ema_alpha == pytest.approx(0.9)
 
 
 def test_low_quality_feature_is_rejected():
@@ -128,6 +157,15 @@ def test_center_drift_is_median_based_and_capped():
     offset = corrector.finish((960.0, 540.0))
     assert offset == pytest.approx((-153.6, -54.0))
     assert corrector.apply(1000.0, 600.0) == pytest.approx((846.4, 546.0))
+
+
+def test_default_center_drift_allows_practical_vertical_correction():
+    corrector = CenterDriftCorrector(1920, 1080)
+    corrector.collect(960.0, 300.0)
+
+    offset = corrector.finish((960.0, 540.0))
+
+    assert offset == pytest.approx((0.0, 162.0))
 
 
 def test_default_runtime_loads_face_model_from_unicode_path(tmp_path: Path):

@@ -5,7 +5,7 @@ from pure_gaze_typing.layout import build_layout, calibration_points, hit_test
 
 def test_layout_has_six_stable_targets_and_back_region():
     layout = build_layout(1920, 1080)
-    assert layout.version == "gaze-grid-v1"
+    assert layout.version == "gaze-grid-v2"
     assert len(layout.targets) == 6
     expected_centers = [
         (326.4, 356.4),

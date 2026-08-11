@@ -87,15 +87,17 @@ class CalibrationSession:
         *,
         center_seconds: float = 1.0,
         target_seconds: float = 0.8,
+        settle_seconds: float = 0.25,
         min_valid_frames: int = 12,
         max_point_seconds: float = 3.0,
     ) -> None:
         del center_seconds, target_seconds
         if not points:
             raise ValueError("calibration requires at least one point")
-        if min_valid_frames < 1 or max_point_seconds <= 0:
+        if min_valid_frames < 1 or max_point_seconds <= 0 or settle_seconds < 0:
             raise ValueError("invalid calibration timing")
         self.points = tuple(points)
+        self.settle_seconds = float(settle_seconds)
         self.min_valid_frames = int(min_valid_frames)
         self.max_point_seconds = float(max_point_seconds)
         self._point_index = 0
@@ -125,8 +127,14 @@ class CalibrationSession:
         now = float(timestamp)
         if self._point_started_at is None:
             self._point_started_at = now
+        elapsed = now - self._point_started_at
         accepted = False
-        if face_detected and not blink and features is not None:
+        if (
+            elapsed >= self.settle_seconds
+            and face_detected
+            and not blink
+            and features is not None
+        ):
             vector = np.asarray(features, dtype=float).reshape(-1)
             if vector.size and np.all(np.isfinite(vector)):
                 if self._feature_width is None:
@@ -135,8 +143,6 @@ class CalibrationSession:
                     raise ValueError("feature width changed during calibration")
                 self._features[self._point_index].append(vector.copy())
                 accepted = True
-
-        elapsed = now - self._point_started_at
         point = self.points[self._point_index]
         if elapsed >= point.duration_seconds and len(self._features[self._point_index]) >= self.min_valid_frames:
             self._point_index += 1

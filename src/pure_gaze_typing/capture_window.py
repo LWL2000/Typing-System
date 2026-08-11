@@ -30,7 +30,7 @@ from .calibration import (
 )
 from .capture_worker import CameraWorker, CapturePacket
 from .eyetrax_runtime import EyeTraxRuntime
-from .layout import build_layout, calibration_points, hit_test
+from .layout import LAYOUT_VERSION, build_layout, calibration_points, hit_test
 from .paths import AppPaths
 from .protocol import GazeSample, Heartbeat, UdpPublisher
 
@@ -299,7 +299,7 @@ class CaptureController(QObject):
             camera_ok=self._camera_ready,
             calibration_ready=metadata is not None,
             calibration_id="" if metadata is None else metadata.calibration_id,
-            layout_version="gaze-grid-v1" if metadata is None else metadata.environment.layout_version,
+            layout_version=LAYOUT_VERSION if metadata is None else metadata.environment.layout_version,
             fps=0.0,
             error=None if self._camera_ready else "camera_not_ready",
         )

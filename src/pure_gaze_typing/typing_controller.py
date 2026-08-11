@@ -235,8 +235,11 @@ class TypingController(QObject):
             return
         if self._prepare_started_at is None:
             self._prepare_started_at = now
+        elapsed = now - self._prepare_started_at
+        if elapsed < 0.25:
+            return
         self.drift.collect(message.screen_x, message.screen_y)
-        if now - self._prepare_started_at >= 1.0:
+        if elapsed >= 1.25:
             self.drift.finish((self.layout.screen_width / 2.0, self.layout.screen_height / 2.0))
             self._preparing = False
             self._message = ""
