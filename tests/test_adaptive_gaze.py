@@ -62,6 +62,7 @@ def test_accepted_update_reduces_residual() -> None:
     after = np.linalg.norm(np.asarray(session.apply(*observed)) - target)
     assert decision.accepted
     assert decision.matrix_version == 1
+    assert decision.huber_weight == pytest.approx(1.0)
     assert after < before
 
 

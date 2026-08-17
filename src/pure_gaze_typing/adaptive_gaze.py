@@ -72,6 +72,7 @@ class AdaptiveDecision:
     residual_before: Optional[float]
     residual_after: Optional[float]
     matrix_version: int
+    huber_weight: float = 0.0
     rollback_performed: bool = False
     unsafe: bool = False
 
@@ -445,6 +446,7 @@ class AdaptiveGazeSession:
                 residual_before,
                 None,
                 target_id,
+                huber_weight=huber_weight,
                 unsafe=reason in {"invalid_affine", "shear", "scale", "rotation", "translation", "condition"},
             )
 
@@ -459,6 +461,7 @@ class AdaptiveGazeSession:
                 residual_before,
                 residual_after,
                 target_id,
+                huber_weight=huber_weight,
             )
 
         self._commit(candidate, candidate_covariance, target_id)
@@ -469,6 +472,7 @@ class AdaptiveGazeSession:
             residual_before=residual_before,
             residual_after=residual_after,
             matrix_version=self.matrix_version,
+            huber_weight=float(huber_weight),
         )
 
     def _stable_window(self) -> StableWindowStats:
@@ -583,6 +587,7 @@ class AdaptiveGazeSession:
         residual_after: Optional[float],
         target_id: str | None,
         *,
+        huber_weight: float = 0.0,
         unsafe: bool = False,
     ) -> AdaptiveDecision:
         self.rejected_updates += 1
@@ -609,6 +614,7 @@ class AdaptiveGazeSession:
             residual_before=residual_before,
             residual_after=residual_after,
             matrix_version=self.matrix_version,
+            huber_weight=float(huber_weight),
             rollback_performed=rollback_performed,
             unsafe=is_unsafe,
         )

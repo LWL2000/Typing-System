@@ -1,7 +1,10 @@
+import csv
+import json
 from dataclasses import replace
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
+import pytest
 
 from pure_gaze_typing.layout import LAYOUT_VERSION
 from pure_gaze_typing.paths import AppPaths
@@ -73,6 +76,46 @@ def make_controller(root: Path, show_gaze_point: bool) -> TypingController:
     return controller
 
 
+def ready_session_controller(
+    root: Path,
+    settings: TypingSettings | None = None,
+) -> TypingController:
+    controller = TypingController(
+        AppPaths.for_root(root),
+        settings or TypingSettings(),
+        1920,
+        1080,
+        receiver=FakeReceiver(),
+    )
+    controller.process_message(
+        Heartbeat(0.0, True, True, "cal-1", LAYOUT_VERSION, 30.0),
+        0.0,
+    )
+    controller.process_message(valid_sample(0.1, 960.0, 540.0), 0.1)
+    controller.start_session(skip_prepare=True)
+    return controller
+
+
+def feed_dwell(
+    controller: TypingController,
+    point: tuple[float, float],
+    *,
+    start: float,
+) -> None:
+    for index in range(24):
+        timestamp = start + index * 0.05
+        controller.process_message(valid_sample(timestamp, *point), timestamp)
+
+
+def read_events(controller: TypingController) -> list[dict[str, str]]:
+    assert controller.recorder is not None
+    with controller.recorder.events_path.open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        return list(csv.DictReader(handle))
+
+
 def test_compatible_heartbeat_marks_capture_online_without_valid_gaze(tmp_path: Path):
     controller = TypingController(
         AppPaths.for_root(tmp_path),
@@ -121,6 +164,135 @@ def test_hidden_gaze_point_does_not_change_selection(tmp_path: Path):
         hidden.process_message(sample, timestamp)
     assert visible.engine.page_kind == hidden.engine.page_kind == PageKind.SUBMENU
     assert visible.last_triggered_target == hidden.last_triggered_target == "main_group_0"
+    assert visible.adaptive.snapshot().matrix_version == hidden.adaptive.snapshot().matrix_version
+
+
+def test_disabled_adaptation_preserves_center_only_coordinates(tmp_path: Path):
+    controller = ready_session_controller(
+        tmp_path,
+        TypingSettings(adaptive_correction_enabled=False),
+    )
+    expected = controller.drift.apply(300.0, 220.0)
+
+    update = controller.process_message(valid_sample(1.0, 300.0, 220.0), 1.0)
+
+    assert update.gaze_point == pytest.approx(expected)
+    assert controller.adaptive.snapshot().matrix_version == 0
+    controller.end_session()
+
+
+def test_core_dwell_updates_affine_and_records_event(tmp_path: Path):
+    controller = ready_session_controller(tmp_path)
+
+    feed_dwell(controller, (250.0, 235.0), start=1.0)
+
+    assert controller.last_triggered_target == "main_group_0"
+    assert controller.adaptive.snapshot().matrix_version == 1
+    rows = read_events(controller)
+    accepted = next(row for row in rows if row["event"] == "adaptive_update_accepted")
+    payload = json.loads(accepted["payload_json"])
+    assert payload["matrix_version"] == 1
+    assert payload["huber_weight"] > 0.0
+    controller.end_session()
+
+
+def test_visible_and_hidden_gaze_use_the_same_adaptive_selection(tmp_path: Path):
+    visible = ready_session_controller(
+        tmp_path / "visible_adaptive",
+        TypingSettings(show_gaze_point=True),
+    )
+    hidden = ready_session_controller(
+        tmp_path / "hidden_adaptive",
+        TypingSettings(show_gaze_point=False),
+    )
+
+    feed_dwell(visible, (250.0, 235.0), start=1.0)
+    feed_dwell(hidden, (250.0, 235.0), start=1.0)
+
+    assert visible.last_triggered_target == hidden.last_triggered_target == "main_group_0"
+    assert visible.adaptive.snapshot().matrix_version == 1
+    assert hidden.adaptive.snapshot().matrix_version == 1
+    visible.end_session()
+    hidden.end_session()
+
+
+def test_new_session_replaces_the_adaptive_matrix(tmp_path: Path):
+    controller = ready_session_controller(tmp_path)
+    feed_dwell(controller, (250.0, 235.0), start=1.0)
+    previous_adaptive = controller.adaptive
+    assert previous_adaptive.snapshot().matrix_version == 1
+
+    controller.start_session(skip_prepare=True)
+
+    assert controller.adaptive is not previous_adaptive
+    assert controller.adaptive.snapshot().matrix_version == 0
+    assert controller.adaptive.apply(300.0, 220.0) == pytest.approx((300.0, 220.0))
+    controller.end_session()
+
+
+def test_adaptive_runtime_error_falls_back_without_closing_session(
+    monkeypatch,
+    tmp_path: Path,
+):
+    controller = ready_session_controller(tmp_path)
+
+    def fail_observe(*_args, **_kwargs):
+        raise RuntimeError("simulated adaptive failure")
+
+    monkeypatch.setattr(controller.adaptive, "observe", fail_observe)
+    expected = controller.drift.apply(300.0, 220.0)
+
+    update = controller.process_message(valid_sample(1.0, 300.0, 220.0), 1.0)
+
+    assert update.gaze_point == pytest.approx(expected)
+    assert controller.recorder is not None
+    assert not controller.adaptive.snapshot().enabled
+    assert "adaptive_disabled" in {row["event"] for row in read_events(controller)}
+    controller.end_session()
+
+
+def test_calibration_change_resets_adaptive_matrix(tmp_path: Path):
+    controller = ready_session_controller(tmp_path)
+    feed_dwell(controller, (250.0, 235.0), start=1.0)
+    assert controller.adaptive.snapshot().matrix_version == 1
+
+    controller.process_message(
+        Heartbeat(3.0, True, True, "cal-2", LAYOUT_VERSION, 30.0),
+        3.0,
+    )
+
+    assert controller.adaptive.snapshot().matrix_version == 0
+    assert controller.adaptive.apply(300.0, 220.0) == pytest.approx((300.0, 220.0))
+    assert "adaptive_reset" in {row["event"] for row in read_events(controller)}
+    controller.end_session()
+
+
+def test_gaze_calibration_mismatch_resets_adaptive_matrix(tmp_path: Path):
+    controller = ready_session_controller(tmp_path)
+    feed_dwell(controller, (250.0, 235.0), start=1.0)
+    assert controller.adaptive.snapshot().matrix_version == 1
+    mismatched = replace(valid_sample(3.0, 300.0, 220.0), calibration_id="cal-2")
+
+    controller.process_message(mismatched, 3.0)
+
+    assert controller.adaptive.snapshot().matrix_version == 0
+    assert controller.adaptive.apply(300.0, 220.0) == pytest.approx((300.0, 220.0))
+    controller.end_session()
+
+
+def test_submenu_anchor_uses_submenu_rectangle(tmp_path: Path):
+    controller = ready_session_controller(tmp_path)
+    feed_dwell(controller, (250.0, 235.0), start=1.0)
+    assert controller.engine.page_kind is PageKind.SUBMENU
+    controller.process_message(valid_sample(2.3, 960.0, 540.0), 2.3)
+    controller.process_message(valid_sample(2.7, 960.0, 540.0), 2.7)
+
+    feed_dwell(controller, (280.0, 760.0), start=3.0)
+
+    assert controller.last_triggered_target == "letter_D"
+    assert controller.adaptive.last_target_id == "target_3"
+    assert controller.adaptive.snapshot().matrix_version == 2
+    controller.end_session()
 
 
 def test_center_prepare_waits_for_initial_eye_movement(tmp_path: Path):

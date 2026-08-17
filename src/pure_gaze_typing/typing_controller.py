@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import time
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from .adaptive_gaze import AdaptiveDecision, AdaptiveGazeSession
 from .eyetrax_runtime import CenterDriftCorrector
 from .gaze_selection import DwellSelector, TripleBlinkDetector
 from .layout import LAYOUT_VERSION, LayoutSpec, build_layout, hit_test
@@ -60,6 +61,7 @@ class TypingController(QObject):
         self.dwell = self._new_dwell(settings)
         self.blinks = TripleBlinkDetector()
         self.drift = CenterDriftCorrector(screen_width, screen_height)
+        self.adaptive = self._new_adaptive(settings)
         self.recorder: SessionRecorder | None = None
         self._status = ConnectionStatus(False, False, "等待眼动采集程序")
         self._expected_calibration_id = ""
@@ -79,8 +81,12 @@ class TypingController(QObject):
         return self._status
 
     def update_settings(self, settings: TypingSettings) -> None:
+        was_enabled = self.settings.adaptive_correction_enabled
         self.settings = settings
         self.dwell = self._new_dwell(settings)
+        self.adaptive.set_enabled(settings.adaptive_correction_enabled)
+        if was_enabled and not settings.adaptive_correction_enabled:
+            self._record_event("adaptive_disabled", {"reason": "user_setting"})
 
     def start_session(self, *, skip_prepare: bool = False) -> None:
         if self.recorder is not None:
@@ -89,6 +95,7 @@ class TypingController(QObject):
         self.dwell = self._new_dwell(self.settings)
         self.blinks.reset()
         self.drift = CenterDriftCorrector(self.layout.screen_width, self.layout.screen_height)
+        self.adaptive = self._new_adaptive(self.settings)
         self.recorder = SessionRecorder.start(
             self.paths,
             self.settings,
@@ -100,12 +107,19 @@ class TypingController(QObject):
             },
             error_callback=lambda message: self._set_message(message),
         )
+        self._record_event(
+            "adaptive_reset",
+            {"reason": "new_session", "matrix_version": 0},
+        )
+        if not self.settings.adaptive_correction_enabled:
+            self._record_event("adaptive_disabled", {"reason": "user_setting"})
         self._preparing = not skip_prepare
         self._prepare_started_at = None
         self._message = "请注视屏幕中心" if self._preparing else ""
         self._emit_update()
 
     def end_session(self) -> None:
+        self.adaptive.clear_window()
         if self.recorder is not None:
             self.recorder.finish(self.engine.full_text())
             self.recorder = None
@@ -126,8 +140,18 @@ class TypingController(QObject):
         current = float(now)
         self._last_message_at = current
         if isinstance(message, Heartbeat):
+            previous_calibration_id = self._expected_calibration_id
             compatible = message.calibration_ready and message.layout_version == self.layout.version
-            if message.calibration_id != self._expected_calibration_id:
+            calibration_changed = bool(previous_calibration_id) and (
+                message.calibration_id != previous_calibration_id
+                or message.layout_version != self.layout.version
+                or not message.calibration_ready
+            )
+            if calibration_changed:
+                decision = self.adaptive.reset("calibration_changed")
+                self._record_event("adaptive_reset", asdict(decision))
+                self.dwell.reset()
+            if message.calibration_id != previous_calibration_id:
                 self._last_valid_gaze_at = None
             self._expected_calibration_id = message.calibration_id if compatible else ""
             if not message.camera_ok:
@@ -149,6 +173,10 @@ class TypingController(QObject):
             and message.layout_version == self.layout.version
         )
         if not compatible:
+            if self._expected_calibration_id:
+                decision = self.adaptive.reset("calibration_changed")
+                self._record_event("adaptive_reset", asdict(decision))
+                self._expected_calibration_id = ""
             self._last_valid_gaze_at = None
             self._set_status(False, False, "眼动校准标识不匹配", False)
             self.dwell.reset()
@@ -167,6 +195,7 @@ class TypingController(QObject):
         if blink_update.triple_blink and self.engine.page_kind is not PageKind.MAIN:
             self.engine.return_to_main()
             self.dwell.reset()
+            self.adaptive.clear_window()
             self.last_triggered_target = "triple_blink_return"
             self._set_message("已返回主菜单")
             self._record_event("triple_blink_return", {})
@@ -177,16 +206,20 @@ class TypingController(QObject):
             self._emit_update()
             return self.current_update()
 
-        corrected: tuple[float, float] | None = None
+        base_point: tuple[float, float] | None = None
         if message.valid and message.screen_x is not None and message.screen_y is not None:
-            corrected = self.drift.apply(message.screen_x, message.screen_y)
-            self._last_gaze_point = corrected
+            base_point = self.drift.apply(message.screen_x, message.screen_y)
 
         if self._preparing:
-            self._process_prepare(message, current, corrected)
+            self._last_gaze_point = base_point
+            self._process_prepare(message, current, base_point)
             self._record_gaze(message, None, 0.0)
             self._emit_update()
             return self.current_update()
+
+        corrected = self._adaptive_point(message, current, base_point)
+        if corrected is not None:
+            self._last_gaze_point = corrected
 
         geometry_target = None
         if corrected is not None:
@@ -209,6 +242,7 @@ class TypingController(QObject):
         if dwell_update.triggered_target_id is not None:
             triggered_logical = self._logical_target(dwell_update.triggered_target_id)
             if triggered_logical is not None:
+                self._consider_adaptive_anchor(dwell_update.triggered_target_id)
                 self._activate(triggered_logical)
         elif logical_target is None and not message.blink:
             self._message = ""
@@ -235,6 +269,75 @@ class TypingController(QObject):
 
     def _new_dwell(self, settings: TypingSettings) -> DwellSelector:
         return DwellSelector(settings.dwell_seconds)
+
+    def _new_adaptive(self, settings: TypingSettings) -> AdaptiveGazeSession:
+        return AdaptiveGazeSession(
+            screen_size=(self.layout.screen_width, self.layout.screen_height),
+            enabled=settings.adaptive_correction_enabled,
+        )
+
+    def _adaptive_point(
+        self,
+        message: GazeSample,
+        now: float,
+        base_point: tuple[float, float] | None,
+    ) -> tuple[float, float] | None:
+        if not self.adaptive.enabled:
+            return base_point
+        try:
+            if base_point is None:
+                self.adaptive.observe(
+                    now,
+                    valid=False,
+                    blink=message.blink,
+                    quality=message.quality,
+                )
+                return None
+            self.adaptive.observe(
+                now,
+                valid=message.valid,
+                blink=message.blink,
+                x=base_point[0],
+                y=base_point[1],
+                quality=message.quality,
+            )
+            return self.adaptive.apply(*base_point)
+        except Exception as error:
+            self.adaptive.set_enabled(False)
+            self._record_event(
+                "adaptive_disabled",
+                {"reason": "runtime_error", "error": str(error)},
+            )
+            self._message = "自适应校正异常，已使用基础眼动"
+            return base_point
+
+    def _consider_adaptive_anchor(self, geometry_target: str) -> None:
+        position = int(geometry_target.removeprefix("target_"))
+        rect = self.layout.targets_for(len(self.engine.targets()))[position]
+        try:
+            decision = self.adaptive.consider_anchor(
+                geometry_target,
+                (rect.left, rect.top, rect.width, rect.height),
+            )
+        except Exception as error:
+            self.adaptive.set_enabled(False)
+            self._record_event(
+                "adaptive_disabled",
+                {"reason": "runtime_error", "error": str(error)},
+            )
+            self._message = "自适应校正异常，已使用基础眼动"
+            return
+        self._record_adaptive_decision(decision)
+
+    def _record_adaptive_decision(self, decision: AdaptiveDecision) -> None:
+        if decision.rollback_performed:
+            event = "adaptive_rollback"
+            self._message = "自适应校正已回滚，已暂停继续学习"
+        elif decision.accepted:
+            event = "adaptive_update_accepted"
+        else:
+            event = "adaptive_update_rejected"
+        self._record_event(event, asdict(decision))
 
     def _process_prepare(
         self,
@@ -263,6 +366,7 @@ class TypingController(QObject):
         return None if target is None else target.target_id
 
     def _activate(self, logical_target: str) -> None:
+        self.adaptive.clear_window()
         self.last_triggered_target = logical_target
         self._last_dwell_target = None
         self._last_dwell_progress = 0.0
@@ -287,6 +391,7 @@ class TypingController(QObject):
     def _disconnect(self, message: str) -> None:
         self.dwell.reset()
         self.blinks.reset()
+        self.adaptive.clear_window()
         self._last_valid_gaze_at = None
         self._last_dwell_target = None
         self._last_dwell_progress = 0.0
