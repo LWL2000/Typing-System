@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
-LAYOUT_VERSION = "gaze-keyboard-v4-brain-layout"
+LAYOUT_VERSION = "gaze-keyboard-v5-equal-grid"
+MAIN_GRID_CELL_INDICES = (0, 3, 6, 1, 7, 2, 5, 8)
+SUBMENU_GRID_CELL_INDICES = (0, 1, 2, 3, 4, 5)
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,15 @@ class PixelRect:
     def contains(self, x: float, y: float) -> bool:
         return self.left <= x <= self.right and self.top <= y <= self.bottom
 
+    def expanded(self, amount: float) -> "PixelRect":
+        margin = max(0.0, float(amount))
+        return PixelRect(
+            self.left - margin,
+            self.top - margin,
+            self.width + margin * 2.0,
+            self.height + margin * 2.0,
+        )
+
     def intersects(self, other: "PixelRect") -> bool:
         return not (
             self.right <= other.left
@@ -51,12 +63,13 @@ class LayoutSpec:
     screen_width: int
     screen_height: int
     top_bar: PixelRect
+    keyboard_bounds: PixelRect
+    grid_cells: tuple[PixelRect, ...]
     main_targets: tuple[PixelRect, ...]
     submenu_targets: tuple[PixelRect, ...]
 
     @property
     def targets(self) -> tuple[PixelRect, ...]:
-        """Parent targets retained as the canonical calibration geometry."""
         return self.main_targets
 
     def targets_for(self, target_count: int) -> tuple[PixelRect, ...]:
@@ -67,45 +80,35 @@ class LayoutSpec:
         raise ValueError("typing pages must contain exactly six or eight targets")
 
 
-def _rect_at(center_x: float, center_y: float, width: float, height: float) -> PixelRect:
-    return PixelRect(center_x - width / 2.0, center_y - height / 2.0, width, height)
-
-
 def build_layout(width: int, height: int) -> LayoutSpec:
     if width <= 0 or height <= 0:
         raise ValueError("screen dimensions must be positive")
     width_f, height_f = float(width), float(height)
-
-    main_cells = (
-        (0, 0),
-        (0, 1),
-        (0, 2),
-        (1, 0),
-        (1, 2),
-        (2, 0),
-        (2, 1),
-        (2, 2),
+    top_height = max(124.0, height_f * 0.14)
+    top_height = min(top_height, height_f * 0.25)
+    top_bar = PixelRect(0.0, 0.0, width_f, top_height)
+    keyboard_bounds = PixelRect(0.0, top_height, width_f, height_f - top_height)
+    cell_width = keyboard_bounds.width / 3.0
+    cell_height = keyboard_bounds.height / 3.0
+    grid_cells = tuple(
+        PixelRect(
+            column * cell_width,
+            keyboard_bounds.top + row * cell_height,
+            cell_width,
+            cell_height,
+        )
+        for row in range(3)
+        for column in range(3)
     )
-    main_x = (width_f * 0.14, width_f * 0.50, width_f * 0.86)
-    main_y = (height_f * 0.23, height_f * 0.50, height_f * 0.77)
-    main_targets = tuple(
-        _rect_at(main_x[column], main_y[row], width_f * 0.26, height_f * 0.19)
-        for column, row in main_cells
-    )
-
-    submenu_cells = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1))
-    submenu_x = (width_f * 0.15, width_f * 0.50, width_f * 0.85)
-    submenu_y = (height_f * 0.28, height_f * 0.72)
-    submenu_targets = tuple(
-        _rect_at(submenu_x[column], submenu_y[row], width_f * 0.28, height_f * 0.28)
-        for column, row in submenu_cells
-    )
-
+    main_targets = tuple(grid_cells[index] for index in MAIN_GRID_CELL_INDICES)
+    submenu_targets = tuple(grid_cells[index] for index in SUBMENU_GRID_CELL_INDICES)
     return LayoutSpec(
         version=LAYOUT_VERSION,
         screen_width=int(width),
         screen_height=int(height),
-        top_bar=PixelRect(width_f * 0.025, height_f * 0.02, width_f * 0.95, height_f * 0.08),
+        top_bar=top_bar,
+        keyboard_bounds=keyboard_bounds,
+        grid_cells=grid_cells,
         main_targets=main_targets,
         submenu_targets=submenu_targets,
     )
@@ -124,15 +127,38 @@ def validation_points(layout: LayoutSpec) -> tuple[tuple[str, tuple[float, float
     )
 
 
-def uniform_grid_calibration_points(
+def reentry_calibration_points(
     layout: LayoutSpec,
 ) -> tuple[tuple[str, tuple[float, float]], ...]:
+    names = (
+        "reentry_top_left",
+        "reentry_top_right",
+        "reentry_center",
+        "reentry_bottom_left",
+        "reentry_bottom_right",
+    )
+    return tuple(
+        (name, layout.grid_cells[index].center)
+        for name, index in zip(names, (0, 2, 4, 6, 8))
+    )
+
+
+def uniform_grid_calibration_points(
+    layout: LayoutSpec,
+    *,
+    rows: int = 3,
+    columns: int = 3,
+) -> tuple[tuple[str, tuple[float, float]], ...]:
+    row_count = int(rows)
+    column_count = int(columns)
+    if not 2 <= row_count <= 5 or not 2 <= column_count <= 5:
+        raise ValueError("calibration grid rows and columns must be between 2 and 5")
     points: list[tuple[str, tuple[float, float]]] = []
-    for row in range(3):
-        columns = range(3) if row % 2 == 0 else reversed(range(3))
-        for column in columns:
-            x = (float(column) + 0.5) * float(layout.screen_width) / 3.0
-            y = (float(row) + 0.5) * float(layout.screen_height) / 3.0
+    for row in range(row_count):
+        column_order = range(column_count) if row % 2 == 0 else reversed(range(column_count))
+        for column in column_order:
+            x = (float(column) + 0.5) * float(layout.screen_width) / float(column_count)
+            y = (float(row) + 0.5) * float(layout.screen_height) / float(row_count)
             points.append((f"grid_{row}_{column}", (x, y)))
     return tuple(points)
 
@@ -143,8 +169,31 @@ def hit_test(
     y: float,
     *,
     target_count: int,
+    preferred_target_id: str | None = None,
+    boundary_tolerance_px: float = 0.0,
+    outer_tolerance_px: float = 32.0,
 ) -> str | None:
-    for index, rect in enumerate(layout.targets_for(target_count)):
-        if rect.contains(x, y):
+    point_x, point_y = float(x), float(y)
+    if not math.isfinite(point_x) or not math.isfinite(point_y):
+        return None
+    bounds = layout.keyboard_bounds
+    outer = max(0.0, float(outer_tolerance_px))
+    if not bounds.expanded(outer).contains(point_x, point_y):
+        return None
+    point_x = min(max(point_x, bounds.left), math.nextafter(bounds.right, bounds.left))
+    point_y = min(max(point_y, bounds.top), math.nextafter(bounds.bottom, bounds.top))
+    targets = layout.targets_for(target_count)
+
+    if preferred_target_id and preferred_target_id.startswith("target_"):
+        try:
+            preferred_index = int(preferred_target_id.removeprefix("target_"))
+            preferred = targets[preferred_index]
+        except (ValueError, IndexError):
+            preferred = None
+        if preferred is not None and preferred.expanded(boundary_tolerance_px).contains(point_x, point_y):
+            return preferred_target_id
+
+    for index, rect in enumerate(targets):
+        if rect.contains(point_x, point_y):
             return f"target_{index}"
     return None

@@ -13,11 +13,12 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from .layout import build_layout
+from .layout import MAIN_GRID_CELL_INDICES, SUBMENU_GRID_CELL_INDICES, build_layout
 from .paths import AppPaths
 from .settings import TypingSettings, save_settings
 from .typing_controller import ConnectionStatus, ControllerUpdate, TypingController
@@ -41,7 +42,7 @@ class StartupWindow(QMainWindow):
             "QMainWindow{background:#f4f6f8;color:#17212b;}"
             "QPushButton{min-height:42px;border:1px solid #8d9aa5;background:white;padding:0 18px;}"
             "QPushButton:disabled{color:#89939b;background:#e9edef;}"
-            "QLabel,QCheckBox,QDoubleSpinBox{font-size:15px;}"
+            "QLabel,QCheckBox,QDoubleSpinBox,QSpinBox{font-size:15px;}"
         )
         central = QWidget()
         self.setCentralWidget(central)
@@ -63,9 +64,14 @@ class StartupWindow(QMainWindow):
         self.dwell_spin.setDecimals(1)
         self.dwell_spin.setSuffix(" 秒")
         self.dwell_spin.setValue(settings.dwell_seconds)
+        self.blink_count_spin = QSpinBox()
+        self.blink_count_spin.setRange(2, 5)
+        self.blink_count_spin.setSuffix(" 次")
+        self.blink_count_spin.setValue(settings.blink_return_count)
         form.addRow("眼动位置", self.gaze_checkbox)
         form.addRow("自适应", self.adaptive_checkbox)
         form.addRow("凝视停留时间", self.dwell_spin)
+        form.addRow("连续眨眼返回次数", self.blink_count_spin)
         root.addLayout(form)
         root.addStretch(1)
         actions = QHBoxLayout()
@@ -95,10 +101,11 @@ class StartupWindow(QMainWindow):
     def _start(self) -> None:
         self._connection_timer.stop()
         settings = TypingSettings(
-            self.gaze_checkbox.isChecked(),
-            self.dwell_spin.value(),
-            False,
-            self.adaptive_checkbox.isChecked(),
+            show_gaze_point=self.gaze_checkbox.isChecked(),
+            dwell_seconds=self.dwell_spin.value(),
+            validate_calibration=False,
+            adaptive_correction_enabled=self.adaptive_checkbox.isChecked(),
+            blink_return_count=self.blink_count_spin.value(),
         )
         save_settings(self.paths.settings_file, settings)
         self.controller.update_settings(settings)
@@ -117,6 +124,7 @@ class KeyboardCanvas(QWidget):
     def __init__(self, settings: TypingSettings) -> None:
         super().__init__()
         self.show_gaze_point = settings.show_gaze_point
+        self.blink_return_count = settings.blink_return_count
         self.target_labels: tuple[str, ...] = ("",) * 8
         self.update_state: ControllerUpdate | None = None
         self.setMinimumSize(800, 600)
@@ -129,10 +137,10 @@ class KeyboardCanvas(QWidget):
         self.history_view.setFont(QFont("Microsoft YaHei", 15))
         self.history_view.document().setDocumentMargin(0)
         self.history_view.setStyleSheet(
-            "QPlainTextEdit{background:#000000;color:#f3f3f3;border:2px solid #777777;"
-            "padding:0 8px;}"
-            "QScrollBar:vertical{width:10px;background:#111111;}"
-            "QScrollBar::handle:vertical{background:#888888;min-height:20px;}"
+            "QPlainTextEdit{background:#111416;color:#f4f7f6;border:1px solid #515b58;"
+            "padding:4px 10px;}"
+            "QScrollBar:vertical{width:10px;background:#111416;}"
+            "QScrollBar::handle:vertical{background:#53cda8;min-height:20px;}"
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
         )
         self._sync_history_geometry()
@@ -155,47 +163,107 @@ class KeyboardCanvas(QWidget):
     def _sync_history_geometry(self) -> None:
         layout = build_layout(max(1, self.width()), max(1, self.height()))
         line_height = self.history_view.fontMetrics().lineSpacing()
-        height = min(round(layout.top_bar.height), line_height * 3 + 12)
-        top = round(layout.top_bar.top + (layout.top_bar.height - height) / 2.0)
+        top = 36
+        height = min(
+            line_height * 3 + 16,
+            max(line_height + 16, round(layout.top_bar.height) - top - 8),
+        )
         self.history_view.setGeometry(
-            round(layout.top_bar.left),
+            10,
             top,
-            round(layout.top_bar.width),
+            max(1, round(layout.top_bar.width) - 20),
             height,
         )
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#000000"))
+        painter.fillRect(self.rect(), QColor("#090b0c"))
         layout = build_layout(max(1, self.width()), max(1, self.height()))
         update = self.update_state
         labels = self.target_labels
-        target_rects = layout.targets_for(len(labels))
         current_target = None if update is None else update.dwell_target_id
         progress = 0.0 if update is None else update.dwell_progress
 
-        font_size = 24 if len(labels) == 8 else 28
+        painter.setPen(QColor("#f3f6f5"))
+        painter.setFont(QFont("Microsoft YaHei", 13, QFont.Weight.DemiBold))
+        painter.drawText(18, 4, 250, 28, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "纯眼动打字器")
+        if update is not None and update.blink_count:
+            painter.setPen(QColor("#e5ad52"))
+            painter.drawText(
+                self.width() - 190,
+                4,
+                172,
+                28,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                f"眨眼 {update.blink_count}/{update.blink_required}",
+            )
+        elif update is not None:
+            painter.setPen(QColor("#55d2ac" if update.status.online else "#e5ad52"))
+            painter.drawText(
+                self.width() - 300,
+                4,
+                282,
+                28,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                "眼动已连接  ·  自适应校正开启"
+                if update.status.online
+                else update.status.message,
+            )
+
+        cell_indices = MAIN_GRID_CELL_INDICES if len(labels) == 8 else SUBMENU_GRID_CELL_INDICES
+        labels_by_cell = {cell_index: labels[position] for position, cell_index in enumerate(cell_indices)}
+        positions_by_cell = {cell_index: position for position, cell_index in enumerate(cell_indices)}
+        font_size = 25 if len(labels) == 8 else 30
         painter.setFont(QFont("Microsoft YaHei", font_size, QFont.Weight.DemiBold))
-        for index, rect in enumerate(target_rects):
-            active = current_target == f"target_{index}"
-            painter.setPen(QPen(QColor("#ff1717" if active else "#a8a8a8"), 6 if active else 1))
-            painter.setBrush(QColor("#858585" if labels[index] else "#111111"))
-            painter.drawRect(round(rect.left), round(rect.top), round(rect.width), round(rect.height))
+        for cell_index, rect in enumerate(layout.grid_cells):
+            position = positions_by_cell.get(cell_index)
+            label = labels_by_cell.get(cell_index, "")
+            active = position is not None and current_target == f"target_{position}"
+            inset = 5
+            draw_left = round(rect.left) + inset
+            draw_top = round(rect.top) + inset
+            draw_width = max(1, round(rect.width) - inset * 2)
+            draw_height = max(1, round(rect.height) - inset * 2)
+            if active:
+                fill = QColor("#334640")
+                border = QColor("#55d2ac")
+            elif label:
+                fill = QColor("#303437")
+                border = QColor("#4c5355")
+            else:
+                fill = QColor("#171a1c")
+                border = QColor("#303638")
+            painter.setPen(QPen(border, 4 if active else 1))
+            painter.setBrush(fill)
+            painter.drawRect(draw_left, draw_top, draw_width, draw_height)
             painter.setPen(QColor("#ffffff"))
             painter.drawText(
-                round(rect.left), round(rect.top), round(rect.width), round(rect.height),
+                draw_left,
+                draw_top,
+                draw_width,
+                draw_height,
                 Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
-                labels[index],
+                label,
             )
             if active:
                 painter.fillRect(
-                    round(rect.left), round(rect.bottom - 9), round(rect.width * progress), 9,
-                    QColor("#ff1717"),
+                    draw_left + 10,
+                    draw_top + draw_height - 14,
+                    round((draw_width - 20) * progress),
+                    9,
+                    QColor("#55d2ac"),
                 )
 
         if update is not None and update.preparing:
-            painter.setBrush(QColor("#2f8c70"))
+            painter.fillRect(
+                round(layout.keyboard_bounds.left),
+                round(layout.keyboard_bounds.top),
+                round(layout.keyboard_bounds.width),
+                round(layout.keyboard_bounds.height),
+                QColor(9, 11, 12, 225),
+            )
+            painter.setBrush(QColor("#55d2ac"))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(self.width() // 2 - 18, self.height() // 2 - 18, 36, 36)
             painter.setPen(QColor("#f3f3f3"))
@@ -203,12 +271,9 @@ class KeyboardCanvas(QWidget):
             painter.drawText(0, self.height() // 2 + 42, self.width(), 40, Qt.AlignmentFlag.AlignCenter, "请注视中心")
 
         if update is not None and update.message:
-            painter.setPen(QColor("#ff5a4f"))
-            painter.setFont(QFont("Microsoft YaHei", 15))
-            painter.drawText(0, self.height() - 48, self.width(), 32, Qt.AlignmentFlag.AlignCenter, update.message)
-        if update is not None and update.blink_count:
-            painter.setPen(QColor("#f0b34f"))
-            painter.drawText(self.width() - 170, 24, 150, 30, Qt.AlignmentFlag.AlignRight, f"眨眼 {update.blink_count}/3")
+            painter.setPen(QColor("#e5ad52"))
+            painter.setFont(QFont("Microsoft YaHei", 13))
+            painter.drawText(280, 4, max(1, self.width() - 580), 28, Qt.AlignmentFlag.AlignCenter, update.message)
         if (
             update is not None
             and self.show_gaze_point

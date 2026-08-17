@@ -34,6 +34,7 @@ class ControllerUpdate:
     dwell_target_id: str | None
     dwell_progress: float
     blink_count: int
+    blink_required: int
     message: str
     preparing: bool
 
@@ -59,7 +60,7 @@ class TypingController(QObject):
         self.receiver = receiver or UdpReceiver()
         self.engine = TypingEngine()
         self.dwell = self._new_dwell(settings)
-        self.blinks = TripleBlinkDetector()
+        self.blinks = TripleBlinkDetector(required_blinks=settings.blink_return_count)
         self.drift = CenterDriftCorrector(screen_width, screen_height)
         self.adaptive = self._new_adaptive(settings)
         self.recorder: SessionRecorder | None = None
@@ -71,6 +72,7 @@ class TypingController(QObject):
         self._last_dwell_target: str | None = None
         self._last_dwell_progress = 0.0
         self._blink_count = 0
+        self._geometry_target: str | None = None
         self._message = ""
         self._preparing = False
         self._prepare_started_at: float | None = None
@@ -84,6 +86,7 @@ class TypingController(QObject):
         was_enabled = self.settings.adaptive_correction_enabled
         self.settings = settings
         self.dwell = self._new_dwell(settings)
+        self.blinks = TripleBlinkDetector(required_blinks=settings.blink_return_count)
         self.adaptive.set_enabled(settings.adaptive_correction_enabled)
         if was_enabled and not settings.adaptive_correction_enabled:
             self._record_event("adaptive_disabled", {"reason": "user_setting"})
@@ -93,7 +96,8 @@ class TypingController(QObject):
             self.end_session()
         self.engine = TypingEngine()
         self.dwell = self._new_dwell(self.settings)
-        self.blinks.reset()
+        self.blinks = TripleBlinkDetector(required_blinks=self.settings.blink_return_count)
+        self._geometry_target = None
         self.drift = CenterDriftCorrector(self.layout.screen_width, self.layout.screen_height)
         self.adaptive = self._new_adaptive(self.settings)
         self.recorder = SessionRecorder.start(
@@ -158,6 +162,10 @@ class TypingController(QObject):
                 self._disconnect("摄像头未就绪")
             elif not compatible:
                 self._set_status(False, False, "校准不可用或界面尺寸不匹配", False)
+            elif not message.streaming:
+                self.dwell.reset()
+                self._geometry_target = None
+                self._set_status(True, True, "眼动采集端已暂停输出", False)
             else:
                 gaze_ready = (
                     self._last_valid_gaze_at is not None
@@ -195,6 +203,7 @@ class TypingController(QObject):
         if blink_update.triple_blink and self.engine.page_kind is not PageKind.MAIN:
             self.engine.return_to_main()
             self.dwell.reset()
+            self._geometry_target = None
             self.adaptive.clear_window()
             self.last_triggered_target = "triple_blink_return"
             self._set_message("已返回主菜单")
@@ -228,7 +237,12 @@ class TypingController(QObject):
                 corrected[0],
                 corrected[1],
                 target_count=len(self.engine.targets()),
+                preferred_target_id=self._geometry_target,
+                boundary_tolerance_px=self._boundary_tolerance_px(),
+                outer_tolerance_px=self._outer_tolerance_px(),
             )
+        if message.valid and not message.blink:
+            self._geometry_target = geometry_target
         logical_target = self._logical_target(geometry_target)
         dwell_update = self.dwell.update(
             current,
@@ -263,6 +277,7 @@ class TypingController(QObject):
             self._last_dwell_target,
             self._last_dwell_progress,
             self._blink_count,
+            self.settings.blink_return_count,
             self._message,
             self._preparing,
         )
@@ -275,6 +290,14 @@ class TypingController(QObject):
             screen_size=(self.layout.screen_width, self.layout.screen_height),
             enabled=settings.adaptive_correction_enabled,
         )
+
+    def _boundary_tolerance_px(self) -> float:
+        cell = self.layout.grid_cells[0]
+        return min(48.0, max(18.0, min(cell.width, cell.height) * 0.08))
+
+    def _outer_tolerance_px(self) -> float:
+        cell = self.layout.grid_cells[0]
+        return min(64.0, max(24.0, min(cell.width, cell.height) * 0.10))
 
     def _adaptive_point(
         self,
@@ -371,6 +394,8 @@ class TypingController(QObject):
         self._last_dwell_target = None
         self._last_dwell_progress = 0.0
         effect = self.engine.activate(logical_target)
+        if effect.page_changed:
+            self._geometry_target = None
         self._record_event("selection", {"target_id": logical_target, "action": effect.action})
         if effect.sent_text is not None:
             if self.recorder is None:
@@ -395,6 +420,7 @@ class TypingController(QObject):
         self._last_valid_gaze_at = None
         self._last_dwell_target = None
         self._last_dwell_progress = 0.0
+        self._geometry_target = None
         self._set_status(False, self._status.calibration_compatible, message, False)
 
     def _set_status(self, online: bool, compatible: bool, message: str, gaze_ready: bool = False) -> None:

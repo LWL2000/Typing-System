@@ -59,12 +59,15 @@ class Heartbeat:
     layout_version: str
     fps: float
     error: str | None = None
+    streaming: bool = True
 
     def __post_init__(self) -> None:
         _require_finite("timestamp", self.timestamp)
         _require_finite("fps", self.fps)
         if self.fps < 0.0:
             raise ValueError("fps must be non-negative")
+        if not isinstance(self.streaming, bool):
+            raise ValueError("streaming must be a boolean")
 
 
 ProtocolMessage = GazeSample | Heartbeat
@@ -139,9 +142,13 @@ class UdpPublisher:
         _validate_loopback(host)
         self._address = (host, int(port))
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.setblocking(False)
 
     def send(self, message: ProtocolMessage) -> None:
-        self._socket.sendto(encode_message(message), self._address)
+        try:
+            self._socket.sendto(encode_message(message), self._address)
+        except BlockingIOError:
+            return
 
     def close(self) -> None:
         self._socket.close()

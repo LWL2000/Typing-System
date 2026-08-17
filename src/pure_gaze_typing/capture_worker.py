@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import logging
+import threading
 import time
+from typing import Callable
 
 import cv2
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
@@ -35,32 +37,64 @@ class CameraWorker(QObject):
     model_saved = pyqtSignal(object)
     failed = pyqtSignal(str)
     stopped = pyqtSignal()
+    runtime_ready = pyqtSignal(object)
 
     def __init__(
         self,
         camera_index: int,
-        runtime: EyeTraxRuntime,
-        store: CalibrationStore,
+        runtime: EyeTraxRuntime | None,
+        store: CalibrationStore | None,
+        *,
+        runtime_factory: Callable[..., EyeTraxRuntime] | None = None,
+        runtime_args: tuple[object, ...] = (),
+        stored_calibration: StoredCalibration | None = None,
     ) -> None:
         super().__init__()
         self.camera_index = int(camera_index)
         self.runtime = runtime
         self.store = store
+        self.runtime_factory = runtime_factory
+        self.runtime_args = tuple(runtime_args)
+        self.stored_calibration = stored_calibration
         self._capture = None
         self._timer: QTimer | None = None
         self._previous_frame_at: float | None = None
         self._last_preview_at: float | None = None
         self._first_frame_logged = False
+        self._stop_requested = threading.Event()
+        self._stopped = False
 
     @pyqtSlot()
     def start(self) -> None:
         LOGGER.info("camera_worker_start index=%s", self.camera_index)
+        if self._stop_requested.is_set():
+            self._finish_stop()
+            return
+        if self.runtime is None:
+            if self.runtime_factory is None:
+                self.failed.emit("眼动运行时初始化器缺失")
+                self._finish_stop()
+                return
+            try:
+                self.runtime = self.runtime_factory(*self.runtime_args)
+                if self.stored_calibration is not None:
+                    self.runtime.load_calibration(self.stored_calibration)
+            except Exception as error:
+                LOGGER.exception("camera_runtime_initialization_failed")
+                self.failed.emit(f"眼动运行时初始化失败：{error}")
+                self._finish_stop()
+                return
+        self.runtime_ready.emit(self.runtime)
+        if self._stop_requested.is_set():
+            self._finish_stop()
+            return
         self._capture = cv2.VideoCapture(self.camera_index)
         LOGGER.info("camera_capture_created")
         if not self._capture.isOpened():
             self.camera_opened.emit(False, f"无法打开摄像头 {self.camera_index}")
             self._capture.release()
             self._capture = None
+            self._finish_stop()
             return
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._read_frame)
@@ -70,7 +104,10 @@ class CameraWorker(QObject):
 
     @pyqtSlot()
     def _read_frame(self) -> None:
-        if self._capture is None:
+        if self._stop_requested.is_set():
+            self.stop()
+            return
+        if self._capture is None or self.runtime is None:
             return
         ok, frame = self._capture.read()
         if not ok:
@@ -111,6 +148,9 @@ class CameraWorker(QObject):
 
     @pyqtSlot(object, object, object)
     def train_model(self, features, labels, metadata: CalibrationMetadata) -> None:
+        if self.runtime is None:
+            self.failed.emit("眼动运行时未就绪")
+            return
         if self._timer is not None:
             self._timer.stop()
         try:
@@ -127,6 +167,9 @@ class CameraWorker(QObject):
 
     @pyqtSlot(object)
     def configure_metadata(self, metadata: CalibrationMetadata) -> None:
+        if self.runtime is None:
+            self.failed.emit("眼动运行时未就绪")
+            return
         try:
             self.runtime.set_metadata(metadata)
             self.model_configured.emit(metadata)
@@ -135,6 +178,9 @@ class CameraWorker(QObject):
 
     @pyqtSlot(object)
     def save_current(self, metadata: CalibrationMetadata) -> None:
+        if self.runtime is None or self.store is None:
+            self.failed.emit("眼动运行时或校准存储未就绪")
+            return
         if self._timer is not None:
             self._timer.stop()
         try:
@@ -149,6 +195,9 @@ class CameraWorker(QObject):
 
     @pyqtSlot(object)
     def load_calibration(self, stored: StoredCalibration) -> None:
+        if self.runtime is None:
+            self.failed.emit("眼动运行时未就绪")
+            return
         try:
             self.runtime.load_calibration(stored)
         except Exception as error:
@@ -156,11 +205,33 @@ class CameraWorker(QObject):
 
     @pyqtSlot()
     def stop(self) -> None:
+        self._stop_requested.set()
+        self._finish_stop()
+
+    def request_stop(self) -> None:
+        """Thread-safe fallback used when the worker event loop is busy."""
+        self._stop_requested.set()
+        capture = self._capture
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                LOGGER.exception("camera_capture_release_failed")
+
+    def _finish_stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         LOGGER.info("camera_worker_stopping")
         if self._timer is not None:
             self._timer.stop()
         if self._capture is not None:
             self._capture.release()
             self._capture = None
+        if self.runtime is not None:
+            try:
+                self.runtime.close()
+            except Exception:
+                LOGGER.exception("camera_runtime_close_failed")
         LOGGER.info("camera_worker_stopped")
         self.stopped.emit()

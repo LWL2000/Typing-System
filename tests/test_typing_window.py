@@ -287,7 +287,7 @@ def test_submenu_anchor_uses_submenu_rectangle(tmp_path: Path):
     controller.process_message(valid_sample(2.3, 960.0, 540.0), 2.3)
     controller.process_message(valid_sample(2.7, 960.0, 540.0), 2.7)
 
-    feed_dwell(controller, (280.0, 760.0), start=3.0)
+    feed_dwell(controller, controller.layout.submenu_targets[3].center, start=3.0)
 
     assert controller.last_triggered_target == "letter_D"
     assert controller.adaptive.last_target_id == "target_3"
@@ -321,6 +321,7 @@ def test_start_button_requires_live_gaze_in_addition_to_compatible_calibration(q
     assert window.adaptive_checkbox.text() == "实时自适应校正（推荐）"
     assert window.adaptive_checkbox.isChecked()
     assert window.dwell_spin.value() == 1.0
+    assert window.blink_count_spin.value() == 3
 
 
 def test_startup_saves_disabled_adaptive_choice(qtbot, tmp_path: Path):
@@ -328,10 +329,12 @@ def test_startup_saves_disabled_adaptive_choice(qtbot, tmp_path: Path):
     window = StartupWindow(FakeTypingController(), TypingSettings(), paths)
     qtbot.addWidget(window)
     window.adaptive_checkbox.setChecked(False)
+    window.blink_count_spin.setValue(2)
 
     window._start()
 
     assert load_settings(paths.settings_file).adaptive_correction_enabled is False
+    assert load_settings(paths.settings_file).blink_return_count == 2
 
 
 def test_startup_window_polls_for_udp_before_session_starts(qtbot, tmp_path: Path):
@@ -420,3 +423,46 @@ def test_three_blinks_return_from_letter_page(tmp_path: Path):
         controller.process_message(valid_sample(start, 960.0, 540.0, blink=True), start)
         controller.process_message(valid_sample(start + 0.12, 960.0, 540.0), start + 0.12)
     assert controller.engine.page_kind is PageKind.MAIN
+
+
+def test_configured_two_blinks_return_from_letter_page(tmp_path: Path):
+    controller = ready_session_controller(
+        tmp_path,
+        TypingSettings(blink_return_count=2),
+    )
+    controller.engine.activate("main_group_0")
+
+    for start in (2.0, 2.6):
+        controller.process_message(valid_sample(start, 960.0, 540.0, blink=True), start)
+        controller.process_message(valid_sample(start + 0.12, 960.0, 540.0), start + 0.12)
+
+    assert controller.engine.page_kind is PageKind.MAIN
+    assert controller.current_update().blink_required == 2
+
+
+def test_paused_capture_heartbeat_is_visible_and_not_gaze_ready(tmp_path: Path):
+    controller = TypingController(
+        AppPaths.for_root(tmp_path),
+        TypingSettings(),
+        1920,
+        1080,
+        receiver=FakeReceiver(),
+    )
+
+    controller.process_message(
+        Heartbeat(
+            0.0,
+            True,
+            True,
+            "cal-1",
+            LAYOUT_VERSION,
+            30.0,
+            streaming=False,
+        ),
+        0.0,
+    )
+
+    assert controller.status.online
+    assert controller.status.calibration_compatible
+    assert not controller.status.gaze_ready
+    assert "暂停" in controller.status.message

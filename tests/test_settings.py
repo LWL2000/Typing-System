@@ -11,15 +11,17 @@ from pure_gaze_typing.settings import TypingSettings, load_settings, save_settin
 
 def test_default_settings_match_product_defaults(tmp_path: Path):
     settings = load_settings(tmp_path / "missing.json")
-    assert settings == TypingSettings(True, 1.0, False)
+    assert settings == TypingSettings(True, 1.0, False, True, 3)
 
 
 def test_settings_round_trip_and_validation(tmp_path: Path):
     path = tmp_path / "settings.json"
-    save_settings(path, TypingSettings(False, 1.4, True))
-    assert load_settings(path) == TypingSettings(False, 1.4, True)
+    save_settings(path, TypingSettings(False, 1.4, True, True, 2))
+    assert load_settings(path) == TypingSettings(False, 1.4, True, True, 2)
     with pytest.raises(ValueError, match="0.5"):
         TypingSettings(True, 0.4, False)
+    with pytest.raises(ValueError, match="blink_return_count"):
+        TypingSettings(blink_return_count=1)
 
 
 def test_old_settings_enable_adaptive_correction_by_default(tmp_path: Path):
@@ -38,6 +40,27 @@ def test_old_settings_enable_adaptive_correction_by_default(tmp_path: Path):
     settings = load_settings(path)
 
     assert settings.adaptive_correction_enabled is True
+    assert settings.blink_return_count == 3
+
+
+def test_previous_adaptive_settings_gain_default_blink_count(tmp_path: Path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "show_gaze_point": True,
+                "dwell_seconds": 1.0,
+                "validate_calibration": False,
+                "adaptive_correction_enabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(path)
+
+    assert settings.adaptive_correction_enabled is False
+    assert settings.blink_return_count == 3
 
 
 def test_adaptive_setting_requires_boolean() -> None:

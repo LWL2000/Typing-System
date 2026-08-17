@@ -4,6 +4,7 @@ import argparse
 import logging
 from pathlib import Path
 import sys
+import tempfile
 
 from PyQt6.QtWidgets import QApplication
 
@@ -45,6 +46,28 @@ def main(argv: list[str] | None = None) -> int:
         assert len(layout.submenu_targets) == 6
         heartbeat = Heartbeat(1.0, True, True, "self-test", LAYOUT_VERSION, 30.0)
         assert decode_message(encode_message(heartbeat)) == heartbeat
+        with tempfile.TemporaryDirectory() as directory:
+            test_paths = AppPaths.for_root(directory)
+            controller = CaptureController(
+                test_paths,
+                lambda camera_index: CalibrationEnvironment(
+                    1920,
+                    1080,
+                    1.0,
+                    camera_index,
+                    LAYOUT_VERSION,
+                ),
+                model,
+            )
+            window = CaptureWindow(controller, test_paths)
+            assert window.calibrate_button.isEnabled()
+            assert window.stream_button.isEnabled()
+            assert window.stop_stream_button.isEnabled()
+            window.stream_button.click()
+            window.stop_stream_button.click()
+            window.close()
+            app.processEvents()
+            assert not window.isVisible()
         return 0
 
     screen = app.primaryScreen()

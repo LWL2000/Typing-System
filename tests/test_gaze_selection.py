@@ -41,6 +41,20 @@ def test_three_complete_blinks_within_window_trigger_once():
     assert not detector.update(1.4, face_detected=True, blink=False).triple_blink
 
 
+def test_configurable_two_blinks_trigger_return_once():
+    detector = TripleBlinkDetector(required_blinks=2)
+
+    events = []
+    for start in (0.0, 0.6):
+        detector.update(start, face_detected=True, blink=True)
+        events.append(detector.update(start + 0.12, face_detected=True, blink=False))
+
+    assert events[0].count == 1
+    assert not events[0].triple_blink
+    assert events[1].count == 2
+    assert events[1].triple_blink
+
+
 def test_long_closure_and_face_loss_do_not_count_as_blinks():
     detector = TripleBlinkDetector()
     detector.update(0.0, face_detected=True, blink=True)

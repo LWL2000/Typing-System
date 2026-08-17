@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -44,10 +45,12 @@ from .layout import (
     build_layout,
     calibration_points,
     hit_test,
+    reentry_calibration_points,
     uniform_grid_calibration_points,
     validation_points,
 )
 from .paths import AppPaths
+from .presence import PresenceEvent, SeatReturnDetector
 from .protocol import GazeSample, Heartbeat, UdpPublisher
 
 
@@ -107,6 +110,12 @@ class CaptureController(QObject):
         self._validation_hits: dict[str, int] = {}
         self._validation_errors: dict[str, float] = {}
         self._failed_targets: tuple[str, ...] = ()
+        self._grid_rows = 3
+        self._grid_columns = 3
+        self._presence = SeatReturnDetector(absence_seconds=1.5)
+        self._reentry_pending = False
+        self._reentry_predictions: dict[str, tuple[float, float]] = {}
+        self._saving_reason = "full"
         self._heartbeat = QTimer(self)
         self._heartbeat.setInterval(1000)
         self._heartbeat.timeout.connect(self._publish_heartbeat)
@@ -117,26 +126,24 @@ class CaptureController(QObject):
         self.stop_camera()
         self.environment = self.environment_factory(int(camera_index))
         LOGGER.info("camera_environment_ready environment=%s", self.environment)
-        try:
-            runtime = self.runtime_factory(
+        stored = self.store.load(self.environment)
+        self.runtime = None
+        self.thread = QThread(self)
+        self.worker = CameraWorker(
+            camera_index,
+            None,
+            self.store,
+            runtime_factory=self.runtime_factory,
+            runtime_args=(
                 self.face_model_path,
                 self.environment.screen_width,
                 self.environment.screen_height,
-            )
-        except Exception as error:
-            LOGGER.exception("camera_runtime_initialization_failed")
-            self.camera_state_changed.emit(False, f"眼动运行时初始化失败：{error}")
-            return
-        LOGGER.info("camera_runtime_ready runtime=%s", type(runtime).__name__)
-        stored = self.store.load(self.environment)
-        if stored is not None:
-            runtime.load_calibration(stored)
-            LOGGER.info("camera_calibration_loaded id=%s", stored.metadata.calibration_id)
-        self.runtime = runtime
-        self.thread = QThread(self)
-        self.worker = CameraWorker(camera_index, runtime, self.store)
+            ),
+            stored_calibration=stored,
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.start)
+        self.worker.runtime_ready.connect(self._on_runtime_ready)
         self.worker.camera_opened.connect(self._on_camera_state)
         self.worker.preview_ready.connect(self.preview_ready)
         self.worker.packet_ready.connect(self._on_packet)
@@ -145,7 +152,10 @@ class CaptureController(QObject):
         self.worker.model_saved.connect(self._on_model_saved)
         self.worker.failed.connect(self._on_worker_failure)
         self.worker.stopped.connect(self.worker.deleteLater)
-        self.worker.stopped.connect(self.thread.quit)
+        self.worker.stopped.connect(
+            self.thread.quit,
+            Qt.ConnectionType.DirectConnection,
+        )
         self._train_requested.connect(self.worker.train_model)
         self._configure_requested.connect(self.worker.configure_metadata)
         self._save_requested.connect(self.worker.save_current)
@@ -157,6 +167,8 @@ class CaptureController(QObject):
         self,
         mode: CalibrationMode | str | bool = CalibrationMode.FAST,
         validate: bool = False,
+        grid_rows: int = 3,
+        grid_columns: int = 3,
     ) -> None:
         if isinstance(mode, bool):
             validate = mode
@@ -165,7 +177,13 @@ class CaptureController(QObject):
             self.calibration_finished.emit(False, "请先连接摄像头", ())
             return
         self._profile = calibration_profile(mode)
+        self._grid_rows = int(grid_rows)
+        self._grid_columns = int(grid_columns)
+        if not 2 <= self._grid_rows <= 5 or not 2 <= self._grid_columns <= 5:
+            self.calibration_finished.emit(False, "校准网格行列数必须在 2 到 5 之间", ())
+            return
         self._validate_after_training = bool(validate)
+        self._saving_reason = "full"
         self._calibration_active = True
         self._retrying = False
         self._streaming = False
@@ -181,7 +199,12 @@ class CaptureController(QObject):
             ("pose_center", center, self._profile.pose_hold_seconds),
         ]
         point_specs.extend(
-            (name, point, duration) for name, point in uniform_grid_calibration_points(layout)
+            (name, point, duration)
+            for name, point in uniform_grid_calibration_points(
+                layout,
+                rows=self._grid_rows,
+                columns=self._grid_columns,
+            )
         )
         target_points = list(calibration_points(layout))
         for pass_index in range(self._profile.target_passes):
@@ -236,6 +259,8 @@ class CaptureController(QObject):
         self._after_configure = None
         self._retrying = False
         self._provisional_metadata = None
+        self._reentry_pending = False
+        self._presence.reset()
         if self.environment is not None:
             stored = self.store.load(self.environment)
             if stored is not None and self.worker is not None:
@@ -260,27 +285,39 @@ class CaptureController(QObject):
         self.stream_state_changed.emit(False, "眼动输出已暂停（摄像头预览继续）")
 
     def stop_camera(self) -> None:
+        forced = False
         if self.worker is not None and self.thread is not None:
             if self.thread.isRunning():
                 LOGGER.info("camera_worker_stop_requested")
                 QMetaObject.invokeMethod(
                     self.worker,
                     "stop",
-                    Qt.ConnectionType.BlockingQueuedConnection,
+                    Qt.ConnectionType.QueuedConnection,
                 )
-            self.thread.quit()
-            if not self.thread.wait(5000):
-                LOGGER.warning("camera_thread_stop_wait_extended")
-                self.thread.wait()
+                if not self.thread.wait(2500):
+                    forced = True
+                    LOGGER.warning("camera_thread_stop_timeout")
+                    self.worker.request_stop()
+                    self.thread.requestInterruption()
+                    self.thread.quit()
+                    if not self.thread.wait(1000):
+                        LOGGER.error("camera_thread_force_terminate")
+                        self.thread.terminate()
+                        self.thread.wait(1000)
             LOGGER.info("camera_thread_stopped")
-        if self.runtime is not None:
-            self.runtime.close()
+        if self.runtime is not None and (self.thread is None or forced):
+            try:
+                self.runtime.close()
+            except Exception:
+                LOGGER.exception("camera_runtime_close_failed")
             LOGGER.info("camera_runtime_closed")
         self.worker = None
         self.thread = None
         self.runtime = None
         self._camera_ready = False
         self._streaming = False
+        self._reentry_pending = False
+        self._presence.reset()
 
     def stop(self) -> None:
         self._heartbeat.stop()
@@ -296,10 +333,25 @@ class CaptureController(QObject):
             LOGGER.info("stream_auto_start source=loaded_calibration")
             self.start_streaming()
 
+    def _on_runtime_ready(self, runtime: EyeTraxRuntime) -> None:
+        self.runtime = runtime
+        LOGGER.info("camera_runtime_ready runtime=%s", type(runtime).__name__)
+        if runtime.metadata is not None:
+            LOGGER.info("camera_calibration_loaded id=%s", runtime.metadata.calibration_id)
+
     def _on_worker_failure(self, message: str) -> None:
+        self._camera_ready = False
+        self._streaming = False
+        if self._calibration_active:
+            self._calibration_active = False
+            self._session = None
+            self._prediction_stage = None
+            self.calibration_finished.emit(False, message, ())
+        self.stream_state_changed.emit(False, "眼动输出已停止")
         self.camera_state_changed.emit(False, message)
 
     def _on_packet(self, packet: CapturePacket) -> None:
+        self._process_presence(packet)
         if self._session is not None and not self._session.complete:
             before = self._session.current_point_id
             self._session.add_frame(
@@ -319,6 +371,37 @@ class CaptureController(QObject):
             self._process_prediction_stage(packet)
         if self._streaming:
             self._publish_estimate(packet)
+
+    def _process_presence(self, packet: CapturePacket) -> None:
+        if self._calibration_active:
+            return
+        event = self._presence.update(
+            packet.timestamp,
+            face_detected=packet.observation.face_detected,
+            active=self._streaming or self._reentry_pending,
+        )
+        if event is PresenceEvent.LEFT:
+            self._reentry_pending = True
+            self._streaming = False
+            LOGGER.info("seat_left_reentry_required")
+            self.stream_state_changed.emit(False, "检测到被试离座，已暂停输出")
+        elif event is PresenceEvent.RETURNED:
+            LOGGER.info("seat_returned_reentry_start")
+            self._start_reentry_calibration()
+
+    def _start_reentry_calibration(self) -> None:
+        if self.environment is None or self.runtime is None or self.runtime.metadata is None:
+            self._reentry_pending = False
+            self.calibration_finished.emit(False, "无可用校准，请重新完成初始校准", ())
+            return
+        self._profile = calibration_profile(CalibrationMode.FAST)
+        self._calibration_active = True
+        self._streaming = False
+        self._provisional_metadata = self.runtime.metadata
+        self._reentry_predictions = {}
+        layout = build_layout(self.environment.screen_width, self.environment.screen_height)
+        target_ids = tuple(name for name, _point in reentry_calibration_points(layout))
+        self._start_prediction_stage("reentry", target_ids)
 
     def _train_completed_session(self) -> None:
         assert self._session is not None and self.environment is not None
@@ -394,6 +477,11 @@ class CaptureController(QObject):
             return
         if len(self._prediction_samples) < 8:
             target_id = self._prediction_target_ids[self._prediction_index]
+            if self._prediction_stage == "reentry":
+                self._prediction_started_at = None
+                self._prediction_samples = []
+                self.calibration_point_changed.emit(target_id)
+                return
             self._prediction_stage = None
             self._calibration_active = False
             self.calibration_finished.emit(False, f"{target_id} 有效注视样本不足，请重试", (target_id,))
@@ -407,6 +495,8 @@ class CaptureController(QObject):
         )
         if self._prediction_stage == "bias":
             self._bias_predictions[target_id] = median_prediction
+        elif self._prediction_stage == "reentry":
+            self._reentry_predictions[target_id] = median_prediction
         else:
             self._record_validation_result(target_id, median_prediction)
 
@@ -422,13 +512,50 @@ class CaptureController(QObject):
         self._prediction_index = None
         if completed_stage == "bias":
             self._finish_bias_correction()
+        elif completed_stage == "reentry":
+            self._finish_reentry_correction()
         else:
             self._finish_validation()
 
     def _point_map(self) -> dict[str, tuple[float, float]]:
         assert self.environment is not None
         layout = build_layout(self.environment.screen_width, self.environment.screen_height)
-        return dict((*calibration_points(layout), *validation_points(layout)))
+        return dict((
+            *calibration_points(layout),
+            *validation_points(layout),
+            *reentry_calibration_points(layout),
+        ))
+
+    def _finish_reentry_correction(self) -> None:
+        assert self._provisional_metadata is not None
+        point_map = self._point_map()
+        names = tuple(self._reentry_predictions)
+        predictions = np.asarray([self._reentry_predictions[name] for name in names], dtype=float)
+        targets = np.asarray([point_map[name] for name in names], dtype=float)
+        try:
+            matrix = fit_screen_affine(predictions, targets)
+        except (ValueError, RuntimeError):
+            LOGGER.exception("reentry_calibration_fit_failed")
+            self._reentry_predictions = {}
+            target_ids = tuple(name for name, _point in reentry_calibration_points(
+                build_layout(self.environment.screen_width, self.environment.screen_height)
+            ))
+            self._start_prediction_stage("reentry", target_ids)
+            return
+        coefficients = tuple(tuple(map(float, row)) for row in matrix)
+        self._provisional_metadata = replace(
+            self._provisional_metadata,
+            calibration_id=f"cal-reentry-{uuid.uuid4().hex[:10]}",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            screen_affine=coefficients,
+            validation_hits=None,
+            validation_total=None,
+            validation_median_error_px=None,
+            validation_max_error_px=None,
+        )
+        self._after_configure = "reentry_save"
+        self._saving_reason = "reentry"
+        self._configure_requested.emit(self._provisional_metadata)
 
     def _finish_bias_correction(self) -> None:
         assert self._provisional_metadata is not None
@@ -462,6 +589,8 @@ class CaptureController(QObject):
             )
             self._start_prediction_stage("validation", target_ids)
         elif action == "save":
+            self._save_requested.emit(metadata)
+        elif action == "reentry_save":
             self._save_requested.emit(metadata)
 
     def _record_validation_result(
@@ -515,6 +644,15 @@ class CaptureController(QObject):
             return
         self._calibration_active = False
         self._retrying = False
+        if self._saving_reason == "reentry":
+            message = "五点快速校正已保存，眼动输出已恢复"
+            self._reentry_pending = False
+            self._presence.reset()
+            self._saving_reason = "full"
+            self.calibration_finished.emit(True, message, ())
+            LOGGER.info("stream_auto_start source=reentry_calibration")
+            self.start_streaming()
+            return
         mode_name = "精确校准" if self._profile.mode is CalibrationMode.PRECISE else "快速校准"
         if self._validate_after_training and self._provisional_metadata is not None:
             message = (
@@ -561,12 +699,13 @@ class CaptureController(QObject):
             layout_version=LAYOUT_VERSION if metadata is None else metadata.environment.layout_version,
             fps=0.0,
             error=None if self._camera_ready else "camera_not_ready",
+            streaming=self._streaming,
         )
         self.publisher.send(heartbeat)
 
 
 class CalibrationModeDialog(QDialog):
-    mode_selected = pyqtSignal(object)
+    mode_selected = pyqtSignal(object, int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -605,6 +744,35 @@ class CalibrationModeDialog(QDialog):
         choices.addStretch()
         root.addLayout(choices)
 
+        grid_row = QHBoxLayout()
+        grid_row.addStretch()
+        grid_label = QLabel("精确校准初始网格")
+        grid_label.setStyleSheet("font-size:16px;font-weight:600;")
+        self.grid_rows_spin = QSpinBox()
+        self.grid_columns_spin = QSpinBox()
+        for spin in (self.grid_rows_spin, self.grid_columns_spin):
+            spin.setRange(2, 5)
+            spin.setValue(3)
+            spin.setFixedWidth(78)
+            spin.setStyleSheet(
+                "QSpinBox{min-height:36px;padding:0 8px;background:#ffffff;"
+                "border:1px solid #91a29a;font-size:16px;}"
+            )
+        multiply = QLabel("×")
+        multiply.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        multiply.setStyleSheet("font-size:20px;")
+        grid_row.addWidget(grid_label)
+        grid_row.addSpacing(14)
+        grid_row.addWidget(self.grid_rows_spin)
+        grid_row.addWidget(multiply)
+        grid_row.addWidget(self.grid_columns_spin)
+        grid_row.addStretch()
+        root.addLayout(grid_row)
+        self.grid_estimate_label = QLabel()
+        self.grid_estimate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.grid_estimate_label.setStyleSheet("font-size:14px;color:#5a6962;")
+        root.addWidget(self.grid_estimate_label)
+
         cancel_row = QHBoxLayout()
         cancel_row.addStretch()
         self.cancel_button = QPushButton("返回")
@@ -617,9 +785,19 @@ class CalibrationModeDialog(QDialog):
         self.fast_button.clicked.connect(lambda: self._choose(CalibrationMode.FAST))
         self.precise_button.clicked.connect(lambda: self._choose(CalibrationMode.PRECISE))
         self.cancel_button.clicked.connect(self.reject)
+        self.grid_rows_spin.valueChanged.connect(self._update_grid_estimate)
+        self.grid_columns_spin.valueChanged.connect(self._update_grid_estimate)
+        self._update_grid_estimate()
+
+    def _update_grid_estimate(self) -> None:
+        point_count = self.grid_rows_spin.value() * self.grid_columns_spin.value()
+        seconds = max(40, round(55 + (point_count - 9) * 1.55))
+        self.grid_estimate_label.setText(f"当前网格预计约 {seconds} 秒")
 
     def _choose(self, mode: CalibrationMode) -> None:
-        self.mode_selected.emit(mode)
+        rows = self.grid_rows_spin.value() if mode is CalibrationMode.PRECISE else 3
+        columns = self.grid_columns_spin.value() if mode is CalibrationMode.PRECISE else 3
+        self.mode_selected.emit(mode, rows, columns)
         self.accept()
 
 
@@ -633,6 +811,8 @@ class CaptureWindow(QMainWindow):
         self.mode_dialog: CalibrationModeDialog | None = None
         self._last_preview_at = 0.0
         self._closing = False
+        self._grid_rows = 3
+        self._grid_columns = 3
         self.setWindowTitle("眼动采集校准")
         self.setMinimumSize(920, 640)
         self.setStyleSheet(
@@ -667,11 +847,8 @@ class CaptureWindow(QMainWindow):
         options = QHBoxLayout()
         self.validation_checkbox = QCheckBox("校准后进行精度验证（推荐）")
         self.calibrate_button = QPushButton("重新校准…")
-        self.calibrate_button.setEnabled(False)
         self.stream_button = QPushButton("恢复输出")
         self.stop_stream_button = QPushButton("暂停输出")
-        self.stream_button.setEnabled(False)
-        self.stop_stream_button.setEnabled(False)
         self.retry_failed_button = QPushButton("重校异常区域")
         self.save_anyway_button = QPushButton("仍然保存")
         self.retry_failed_button.hide()
@@ -715,12 +892,10 @@ class CaptureWindow(QMainWindow):
 
     def _request_stream_start(self) -> None:
         self.result_label.setText("正在恢复眼动输出…")
-        self.stream_button.setEnabled(False)
         self.controller.start_streaming()
 
     def _request_stream_stop(self) -> None:
         self.result_label.setText("正在暂停眼动输出…")
-        self.stop_stream_button.setEnabled(False)
         self.controller.stop_streaming()
 
     def _begin_calibration(self) -> None:
@@ -732,11 +907,23 @@ class CaptureWindow(QMainWindow):
         self.mode_dialog.raise_()
         self.mode_dialog.activateWindow()
 
-    def _start_selected_calibration(self, mode: CalibrationMode) -> None:
+    def _start_selected_calibration(
+        self,
+        mode: CalibrationMode,
+        grid_rows: int,
+        grid_columns: int,
+    ) -> None:
         self._calibration_mode = True
+        self._grid_rows = int(grid_rows)
+        self._grid_columns = int(grid_columns)
         self._controls.hide()
         self.showFullScreen()
-        self.controller.start_calibration(mode, self.validation_checkbox.isChecked())
+        self.controller.start_calibration(
+            mode,
+            self.validation_checkbox.isChecked(),
+            grid_rows,
+            grid_columns,
+        )
 
     def _cancel_mode_choice(self) -> None:
         self._calibration_mode = False
@@ -756,7 +943,12 @@ class CaptureWindow(QMainWindow):
         layout = build_layout(max(1, self.width()), max(1, self.height()))
         point_map = dict(calibration_points(layout))
         point_map.update(validation_points(layout))
-        point_map.update(uniform_grid_calibration_points(layout))
+        point_map.update(uniform_grid_calibration_points(
+            layout,
+            rows=self._grid_rows,
+            columns=self._grid_columns,
+        ))
+        point_map.update(reentry_calibration_points(layout))
         point_map["pose_center"] = (layout.screen_width / 2.0, layout.screen_height / 2.0)
         return point_map.get(self._highlight_id)
 
@@ -768,12 +960,7 @@ class CaptureWindow(QMainWindow):
         painter.fillRect(self.rect(), QColor("#f7f8fa"))
         layout = build_layout(self.width(), self.height())
         painter.setPen(QPen(QColor("#a6b0b8"), 2))
-        target_rects = (
-            layout.submenu_targets
-            if self._highlight_id and self._highlight_id.startswith("validation_")
-            else layout.main_targets
-        )
-        for rect in target_rects:
+        for rect in layout.grid_cells:
             painter.drawRect(round(rect.left), round(rect.top), round(rect.width), round(rect.height))
         center = self.highlight_center()
         if center is not None:
@@ -788,7 +975,12 @@ class CaptureWindow(QMainWindow):
         font.setPointSize(18)
         font.setBold(True)
         painter.setFont(font)
-        prompt = "保持自然坐姿并注视中心" if self._highlight_id == "pose_center" else "请注视绿色圆点"
+        if self._highlight_id == "pose_center":
+            prompt = "保持自然坐姿并注视中心"
+        elif self._highlight_id and self._highlight_id.startswith("reentry_"):
+            prompt = "已检测到重新就座，请完成五点快速校正"
+        else:
+            prompt = "请注视绿色圆点"
         painter.drawText(
             0,
             28,
@@ -800,7 +992,6 @@ class CaptureWindow(QMainWindow):
 
     def _on_camera_state(self, ready: bool, message: str) -> None:
         self.camera_status_label.setText(message)
-        self.calibrate_button.setEnabled(ready)
         self.connect_button.setEnabled(True)
         self.connect_button.setText("重新连接" if ready else "连接摄像头")
 
@@ -817,8 +1008,8 @@ class CaptureWindow(QMainWindow):
 
     def _on_stream_state(self, running: bool, message: str) -> None:
         self.result_label.setText(message)
-        self.stream_button.setEnabled(not running)
-        self.stop_stream_button.setEnabled(running)
+        self.stream_button.setEnabled(True)
+        self.stop_stream_button.setEnabled(True)
         self.stream_button.setText("已在自动输出" if running else "恢复输出")
 
     def _on_preview(self, image: QImage) -> None:

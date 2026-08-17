@@ -46,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat = Heartbeat(1.0, True, True, "self-test", LAYOUT_VERSION, 30.0)
             assert decode_message(encode_message(heartbeat)) == heartbeat
             assert window.dwell_spin.value() == 1.0
+            assert window.blink_count_spin.value() == 3
             controller.close()
             window.close()
         return 0

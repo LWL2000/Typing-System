@@ -43,8 +43,17 @@ def test_gaze_sample_round_trip_rejects_nonfinite_coordinates():
 
 
 def test_heartbeat_round_trip_and_unknown_fields_are_rejected():
-    heartbeat = Heartbeat(4.0, True, True, "cal-1", "gaze-grid-v1", 30.0)
+    heartbeat = Heartbeat(
+        4.0,
+        True,
+        True,
+        "cal-1",
+        "gaze-grid-v1",
+        30.0,
+        streaming=False,
+    )
     assert decode_message(encode_message(heartbeat)) == heartbeat
+    assert not heartbeat.streaming
     payload = json.loads(encode_message(heartbeat).decode("utf-8"))
     payload["unexpected"] = True
     with pytest.raises(ValueError, match="fields"):

@@ -127,11 +127,15 @@ class TripleBlinkDetector:
         min_closed_seconds: float = 0.05,
         max_closed_seconds: float = 0.6,
         cooldown_seconds: float = 1.0,
+        required_blinks: int = 3,
     ) -> None:
         self.window_seconds = float(window_seconds)
         self.min_closed_seconds = float(min_closed_seconds)
         self.max_closed_seconds = float(max_closed_seconds)
         self.cooldown_seconds = float(cooldown_seconds)
+        if isinstance(required_blinks, bool) or not 2 <= int(required_blinks) <= 5:
+            raise ValueError("required_blinks must be between 2 and 5")
+        self.required_blinks = int(required_blinks)
         self._blink_times: deque[float] = deque()
         self._closed_since: float | None = None
         self._invalid_closure = False
@@ -174,8 +178,8 @@ class TripleBlinkDetector:
 
         self._blink_times.append(now)
         count = len(self._blink_times)
-        if count >= 3:
+        if count >= self.required_blinks:
             self._blink_times.clear()
             self._cooldown_until = now + self.cooldown_seconds
-            return BlinkUpdate(3, True)
+            return BlinkUpdate(self.required_blinks, True)
         return BlinkUpdate(count, False)

@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 import numpy as np
 import pytest
@@ -9,9 +10,11 @@ import pure_gaze_typing.capture_worker as worker_module
 from pure_gaze_typing.calibration import CalibrationEnvironment, stable_median_prediction
 from pure_gaze_typing.calibration import CalibrationMetadata, CalibrationMode
 from pure_gaze_typing.capture_worker import CameraWorker
+from pure_gaze_typing.capture_worker import CapturePacket
 from pure_gaze_typing.capture_window import CaptureController, CaptureWindow
 from pure_gaze_typing.eyetrax_runtime import FrameObservation, GazeEstimate
 from pure_gaze_typing.layout import build_layout
+from pure_gaze_typing.layout import reentry_calibration_points
 from pure_gaze_typing.paths import AppPaths
 
 
@@ -29,18 +32,19 @@ class FakeCaptureController(QObject):
         self.stop_calls = 0
         self.camera_calls = []
         self.stop_stream_calls = 0
+        self.start_stream_calls = 0
 
     def start_camera(self, index):
         self.camera_calls.append(index)
 
-    def start_calibration(self, mode, validate=False):
-        self.calibration_calls.append((mode, validate))
+    def start_calibration(self, mode, validate=False, grid_rows=3, grid_columns=3):
+        self.calibration_calls.append((mode, validate, grid_rows, grid_columns))
 
     def cancel_calibration(self):
         self.cancel_calls += 1
 
     def start_streaming(self):
-        return None
+        self.start_stream_calls += 1
 
     def stop_streaming(self):
         self.stop_stream_calls += 1
@@ -102,11 +106,18 @@ class RecordingStore:
 
 
 class FrameRuntime:
+    def __init__(self):
+        self.closed = False
+        self.metadata = None
+
     def extract(self, _frame):
         return FrameObservation(np.ones(2), True, False)
 
     def estimate(self, _observation, *, timestamp):
         return GazeEstimate(True, True, False, 1.0, 10.0, 20.0, 10.0, 20.0)
+
+    def close(self):
+        self.closed = True
 
 
 class FakeVideoCapture:
@@ -156,6 +167,54 @@ def test_camera_worker_caps_frame_timer_instead_of_running_unbounded(monkeypatch
     assert capture.released
 
 
+def test_camera_runtime_is_constructed_in_worker_start_not_ui_constructor(monkeypatch):
+    capture = FakeVideoCapture()
+    runtime = FrameRuntime()
+    calls = []
+    monkeypatch.setattr(worker_module.cv2, "VideoCapture", lambda _index: capture)
+    monkeypatch.setattr(worker_module, "QTimer", FakeTimer)
+
+    worker = CameraWorker(
+        0,
+        None,
+        None,
+        runtime_factory=lambda *args: calls.append(args) or runtime,
+        runtime_args=("face.task", 1920, 1080),
+    )
+
+    assert calls == []
+    worker.start()
+    assert calls == [("face.task", 1920, 1080)]
+    worker.stop()
+    assert runtime.closed
+
+
+def test_slow_runtime_initialization_does_not_block_the_ui_thread(qtbot, monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(worker_module.cv2, "VideoCapture", lambda _index: FakeVideoCapture())
+
+    def slow_runtime(*_args):
+        time.sleep(0.25)
+        return FrameRuntime()
+
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda index: CalibrationEnvironment(1920, 1080, 1.0, index, "gaze-grid-v1"),
+        tmp_path / "face_landmarker.task",
+        runtime_factory=slow_runtime,
+        publisher_factory=FakePublisher,
+    )
+    states = []
+    controller.camera_state_changed.connect(lambda ready, message: states.append((ready, message)))
+
+    started_at = time.monotonic()
+    controller.start_camera(0)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.15
+    qtbot.waitUntil(lambda: any(ready for ready, _message in states), timeout=1000)
+    controller.stop()
+
+
 def test_camera_worker_emits_preview_at_ten_fps_while_preserving_gaze_packets(monkeypatch):
     worker = CameraWorker(0, FrameRuntime(), None)
     worker._capture = FakeVideoCapture()
@@ -173,19 +232,19 @@ def test_camera_worker_emits_preview_at_ten_fps_while_preserving_gaze_packets(mo
     assert len(previews) == 2
 
 
-def test_validation_is_off_by_default_and_calibration_button_tracks_camera(qtbot, tmp_path: Path):
+def test_primary_controls_are_clickable_even_before_camera_is_ready(qtbot, tmp_path: Path):
     controller = FakeCaptureController()
     window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
     qtbot.addWidget(window)
     assert not window.validation_checkbox.isChecked()
-    assert not window.calibrate_button.isEnabled()
-    assert not window.stream_button.isEnabled()
-    assert not window.stop_stream_button.isEnabled()
+    assert window.calibrate_button.isEnabled()
+    assert window.stream_button.isEnabled()
+    assert window.stop_stream_button.isEnabled()
     controller.camera_state_changed.emit(True, "摄像头 0 已连接")
     assert window.calibrate_button.isEnabled()
     assert window.camera_status_label.text() == "摄像头 0 已连接"
     controller.stream_state_changed.emit(True, "眼动数据正在输出")
-    assert not window.stream_button.isEnabled()
+    assert window.stream_button.isEnabled()
     assert window.stop_stream_button.isEnabled()
     assert window.stop_stream_button.text() == "暂停输出"
 
@@ -212,6 +271,20 @@ def test_pause_output_responds_on_mouse_press(qtbot, tmp_path: Path):
 
     assert controller.stop_stream_calls == 1
     assert "正在暂停" in window.result_label.text()
+
+
+def test_resume_output_responds_to_real_mouse_click(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+    controller.camera_state_changed.emit(True, "摄像头 0 已连接")
+    controller.stream_state_changed.emit(False, "眼动输出已暂停")
+
+    qtbot.mouseClick(window.stream_button, Qt.MouseButton.LeftButton)
+
+    assert controller.start_stream_calls == 1
+    assert "正在恢复" in window.result_label.text()
 
 
 def test_reconnect_responds_before_camera_initialization(qtbot, tmp_path: Path):
@@ -298,6 +371,8 @@ def test_calibration_button_opens_fullscreen_mode_menu_with_estimates(qtbot, tmp
     assert window.mode_dialog.isFullScreen()
     assert "25–35 秒" in window.mode_dialog.fast_button.text()
     assert "50–60 秒" in window.mode_dialog.precise_button.text()
+    assert window.mode_dialog.grid_rows_spin.value() == 3
+    assert window.mode_dialog.grid_columns_spin.value() == 3
     assert controller.calibration_calls == []
 
 
@@ -307,12 +382,39 @@ def test_mode_menu_starts_selected_calibration_with_validation_choice(qtbot, tmp
     qtbot.addWidget(window)
     window.validation_checkbox.setChecked(True)
     window._begin_calibration()
+    window.mode_dialog.grid_rows_spin.setValue(4)
+    window.mode_dialog.grid_columns_spin.setValue(5)
 
     qtbot.mouseClick(window.mode_dialog.precise_button, Qt.MouseButton.LeftButton)
 
-    assert controller.calibration_calls == [(CalibrationMode.PRECISE, True)]
+    assert controller.calibration_calls == [(CalibrationMode.PRECISE, True, 4, 5)]
     assert window._calibration_mode
     assert not window._controls.isVisible()
+
+
+def test_precise_calibration_uses_selected_initial_grid(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda index: CalibrationEnvironment(1920, 1080, 1.0, index, "gaze-grid-v1"),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    controller.environment = CalibrationEnvironment(1920, 1080, 1.0, 0, "gaze-grid-v1")
+    controller._camera_ready = True
+
+    controller.start_calibration(
+        CalibrationMode.PRECISE,
+        False,
+        grid_rows=4,
+        grid_columns=5,
+    )
+
+    assert controller._session is not None
+    grid_ids = [point.target_id for point in controller._session.points if point.target_id.startswith("grid_")]
+    assert len(grid_ids) == 20
+    assert grid_ids[0] == "grid_0_0"
+    assert grid_ids[-1] == "grid_3_0"
+    controller.stop()
 
 
 def test_escape_from_mode_menu_returns_without_starting(qtbot, tmp_path: Path):
@@ -480,7 +582,7 @@ def test_saved_calibration_automatically_resumes_output(tmp_path: Path):
     controller.stop()
 
 
-def test_runtime_initialization_failure_is_reported_without_escaping(tmp_path: Path):
+def test_runtime_initialization_failure_is_reported_without_escaping(qtbot, tmp_path: Path):
     def failing_runtime(*_args, **_kwargs):
         raise FileNotFoundError("模型无法加载")
 
@@ -500,6 +602,7 @@ def test_runtime_initialization_failure_is_reported_without_escaping(tmp_path: P
 
     controller.start_camera(0)
 
+    qtbot.waitUntil(lambda: bool(states), timeout=1000)
     assert states == [(False, "眼动运行时初始化失败：模型无法加载")]
     controller.stop()
 
@@ -520,7 +623,7 @@ def test_stop_disables_heartbeat_before_closing_resources(qtbot, tmp_path: Path)
     assert not controller._heartbeat.isActive()
 
 
-def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: Path):
+def test_stop_camera_uses_bounded_wait_and_force_fallback(monkeypatch, tmp_path: Path):
     controller = CaptureController(
         AppPaths.for_root(tmp_path),
         lambda camera_index: CalibrationEnvironment(
@@ -533,11 +636,13 @@ def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: 
 
     class FakeRuntime:
         def close(self):
-            assert events[-1] == ("thread_wait", 5000)
             events.append("runtime_close")
 
     class FakeWorker:
         stopped = False
+
+        def request_stop(self):
+            events.append("worker_request_stop")
 
     worker = FakeWorker()
     runtime = FakeRuntime()
@@ -547,12 +652,17 @@ def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: 
             return True
 
         def quit(self):
-            assert worker.stopped
             events.append("thread_quit")
 
         def wait(self, timeout):
             events.append(("thread_wait", timeout))
-            return True
+            return False
+
+        def requestInterruption(self):
+            events.append("thread_interrupt")
+
+        def terminate(self):
+            events.append("thread_terminate")
 
     class FakeMetaObject:
         @staticmethod
@@ -571,4 +681,99 @@ def test_stop_camera_stops_worker_before_quitting_thread(monkeypatch, tmp_path: 
     controller.stop_camera()
 
     assert events[0][0] == "worker_stop"
-    assert events[1:] == ["thread_quit", ("thread_wait", 5000), "runtime_close"]
+    assert all(event != ("thread_wait", None) for event in events)
+    assert ("thread_wait", 2500) in events
+    assert ("thread_wait", 1000) in events
+    assert "thread_terminate" in events
+
+
+def test_sustained_leave_then_return_starts_five_point_reentry_calibration(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda index: CalibrationEnvironment(1920, 1080, 1.0, index, "gaze-grid-v1"),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    metadata = CalibrationMetadata(
+        "cal-ready",
+        "2026-08-11T12:00:00+08:00",
+        CalibrationEnvironment(1920, 1080, 1.0, 0, "gaze-grid-v1"),
+        (0.0, 0.0),
+        (2.0, 2.0),
+    )
+    controller.environment = metadata.environment
+    controller.runtime = ReadyRuntime(metadata)
+    controller.worker = object()
+    controller._camera_ready = True
+    controller._streaming = True
+    points = []
+    controller.calibration_point_changed.connect(points.append)
+
+    def packet(timestamp, face_detected):
+        return CapturePacket(
+            timestamp,
+            FrameObservation(None, face_detected, False),
+            GazeEstimate(False, face_detected, False, 0.0),
+            30.0,
+        )
+
+    controller._on_packet(packet(0.0, False))
+    controller._on_packet(packet(1.5, False))
+    assert controller._reentry_pending
+    assert not controller._streaming
+
+    controller._on_packet(packet(1.6, True))
+
+    assert controller._calibration_active
+    assert controller._prediction_stage == "reentry"
+    assert points[-1] == "reentry_top_left"
+    controller.worker = None
+    controller.stop()
+
+
+def test_five_point_reentry_correction_is_saved_and_resumes_output(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda index: CalibrationEnvironment(1920, 1080, 1.0, index, "gaze-grid-v1"),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    environment = CalibrationEnvironment(1920, 1080, 1.0, 0, "gaze-grid-v1")
+    metadata = CalibrationMetadata(
+        "cal-before-reentry",
+        "2026-08-11T12:00:00+08:00",
+        environment,
+        (0.0, 0.0),
+        (2.0, 2.0),
+    )
+    runtime = ReadyRuntime(metadata)
+    controller.environment = environment
+    controller.runtime = runtime
+    controller.worker = object()
+    controller._camera_ready = True
+    controller._calibration_active = True
+    controller._reentry_pending = True
+    controller._provisional_metadata = metadata
+    layout = build_layout(1920, 1080)
+    controller._reentry_predictions = {
+        name: (point[0] - 24.0, point[1] + 16.0)
+        for name, point in reentry_calibration_points(layout)
+    }
+    configured = []
+    saved = []
+    controller._configure_requested.connect(configured.append)
+    controller._save_requested.connect(saved.append)
+
+    controller._finish_reentry_correction()
+
+    assert len(configured) == 1
+    assert configured[0].calibration_id.startswith("cal-reentry-")
+    assert configured[0].screen_affine
+    controller._on_model_configured(configured[0])
+    assert saved == configured
+    runtime.metadata = configured[0]
+    controller._on_model_saved(object())
+    assert controller._streaming
+    assert not controller._reentry_pending
+    controller.worker = None
+    controller.stop()
