@@ -55,6 +55,8 @@ class StartupWindow(QMainWindow):
         form = QFormLayout()
         self.gaze_checkbox = QCheckBox("显示实时眼动位置")
         self.gaze_checkbox.setChecked(settings.show_gaze_point)
+        self.adaptive_checkbox = QCheckBox("实时自适应校正（推荐）")
+        self.adaptive_checkbox.setChecked(settings.adaptive_correction_enabled)
         self.dwell_spin = QDoubleSpinBox()
         self.dwell_spin.setRange(0.5, 3.0)
         self.dwell_spin.setSingleStep(0.1)
@@ -62,6 +64,7 @@ class StartupWindow(QMainWindow):
         self.dwell_spin.setSuffix(" 秒")
         self.dwell_spin.setValue(settings.dwell_seconds)
         form.addRow("眼动位置", self.gaze_checkbox)
+        form.addRow("自适应", self.adaptive_checkbox)
         form.addRow("凝视停留时间", self.dwell_spin)
         root.addLayout(form)
         root.addStretch(1)
@@ -95,6 +98,7 @@ class StartupWindow(QMainWindow):
             self.gaze_checkbox.isChecked(),
             self.dwell_spin.value(),
             False,
+            self.adaptive_checkbox.isChecked(),
         )
         save_settings(self.paths.settings_file, settings)
         self.controller.update_settings(settings)

@@ -6,7 +6,7 @@ from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from pure_gaze_typing.layout import LAYOUT_VERSION
 from pure_gaze_typing.paths import AppPaths
 from pure_gaze_typing.protocol import GazeSample, Heartbeat
-from pure_gaze_typing.settings import TypingSettings
+from pure_gaze_typing.settings import TypingSettings, load_settings
 from pure_gaze_typing.typing_controller import ConnectionStatus, TypingController
 from pure_gaze_typing.typing_engine import PageKind
 from pure_gaze_typing.typing_window import StartupWindow, TypingWindow
@@ -146,7 +146,20 @@ def test_start_button_requires_live_gaze_in_addition_to_compatible_calibration(q
     controller.status_changed.emit(ConnectionStatus(True, True, "眼动数据已就绪", True))
     assert window.start_button.isEnabled()
     assert window.gaze_checkbox.isChecked()
+    assert window.adaptive_checkbox.text() == "实时自适应校正（推荐）"
+    assert window.adaptive_checkbox.isChecked()
     assert window.dwell_spin.value() == 1.0
+
+
+def test_startup_saves_disabled_adaptive_choice(qtbot, tmp_path: Path):
+    paths = AppPaths.for_root(tmp_path)
+    window = StartupWindow(FakeTypingController(), TypingSettings(), paths)
+    qtbot.addWidget(window)
+    window.adaptive_checkbox.setChecked(False)
+
+    window._start()
+
+    assert load_settings(paths.settings_file).adaptive_correction_enabled is False
 
 
 def test_startup_window_polls_for_udp_before_session_starts(qtbot, tmp_path: Path):

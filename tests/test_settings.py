@@ -1,4 +1,5 @@
 import logging
+import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,29 @@ def test_settings_round_trip_and_validation(tmp_path: Path):
     assert load_settings(path) == TypingSettings(False, 1.4, True)
     with pytest.raises(ValueError, match="0.5"):
         TypingSettings(True, 0.4, False)
+
+
+def test_old_settings_enable_adaptive_correction_by_default(tmp_path: Path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "show_gaze_point": False,
+                "dwell_seconds": 1.2,
+                "validate_calibration": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(path)
+
+    assert settings.adaptive_correction_enabled is True
+
+
+def test_adaptive_setting_requires_boolean() -> None:
+    with pytest.raises(ValueError, match="adaptive_correction_enabled"):
+        TypingSettings(adaptive_correction_enabled="yes")
 
 
 def test_malformed_settings_are_quarantined(tmp_path: Path):
