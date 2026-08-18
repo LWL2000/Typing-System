@@ -60,7 +60,7 @@ LOGGER = logging.getLogger("pure_gaze_typing.capture")
 
 class CaptureController(QObject):
     MIN_PREDICTION_SAMPLES = 8
-    MAX_PREDICTION_CAPTURE_SECONDS = 1.20
+    MAX_PREDICTION_CAPTURE_SECONDS = 1.60
 
     camera_state_changed = pyqtSignal(bool, str)
     calibration_point_changed = pyqtSignal(str)
@@ -108,6 +108,7 @@ class CaptureController(QObject):
         self._prediction_index: int | None = None
         self._prediction_started_at: float | None = None
         self._prediction_samples: list[tuple[float, float]] = []
+        self._prediction_frame_counts: dict[str, int] = {}
         self._bias_predictions: dict[str, tuple[float, float]] = {}
         self._after_configure: str | None = None
         self._validation_index: int | None = None
@@ -541,6 +542,13 @@ class CaptureController(QObject):
         self._prediction_index = 0
         self._prediction_started_at = None
         self._prediction_samples = []
+        self._prediction_frame_counts = {
+            "total": 0,
+            "accepted": 0,
+            "no_face": 0,
+            "blink": 0,
+            "no_raw_prediction": 0,
+        }
         self.calibration_point_changed.emit(self._prediction_target_ids[0])
 
     def _process_prediction_stage(self, packet: CapturePacket) -> None:
@@ -552,15 +560,22 @@ class CaptureController(QObject):
         settle = self._profile.validation_settle_seconds
         capture = self._profile.validation_capture_seconds
         estimate = packet.estimate
-        if (
-            elapsed >= settle
-            and estimate.valid
-            and estimate.raw_x is not None
-            and estimate.raw_y is not None
-            and np.isfinite(estimate.raw_x)
-            and np.isfinite(estimate.raw_y)
-        ):
-            self._prediction_samples.append((estimate.raw_x, estimate.raw_y))
+        if elapsed >= settle:
+            self._prediction_frame_counts["total"] += 1
+            if not packet.observation.face_detected:
+                self._prediction_frame_counts["no_face"] += 1
+            elif packet.observation.blink:
+                self._prediction_frame_counts["blink"] += 1
+            elif (
+                estimate.raw_x is None
+                or estimate.raw_y is None
+                or not np.isfinite(estimate.raw_x)
+                or not np.isfinite(estimate.raw_y)
+            ):
+                self._prediction_frame_counts["no_raw_prediction"] += 1
+            else:
+                self._prediction_samples.append((estimate.raw_x, estimate.raw_y))
+                self._prediction_frame_counts["accepted"] += 1
         if elapsed < settle + capture:
             return
         if (
@@ -576,10 +591,11 @@ class CaptureController(QObject):
                 self.calibration_point_changed.emit(target_id)
                 return
             LOGGER.warning(
-                "prediction_samples_insufficient target=%s samples=%s fps=%.1f",
+                "prediction_samples_insufficient target=%s samples=%s fps=%.1f counts=%s",
                 target_id,
                 len(self._prediction_samples),
                 packet.fps,
+                self._prediction_frame_counts,
             )
             self._prediction_stage = None
             self._calibration_active = False
@@ -602,6 +618,13 @@ class CaptureController(QObject):
         self._prediction_index += 1
         self._prediction_started_at = None
         self._prediction_samples = []
+        self._prediction_frame_counts = {
+            "total": 0,
+            "accepted": 0,
+            "no_face": 0,
+            "blink": 0,
+            "no_raw_prediction": 0,
+        }
         if self._prediction_index < len(self._prediction_target_ids):
             self.calibration_point_changed.emit(self._prediction_target_ids[self._prediction_index])
             return
@@ -809,7 +832,7 @@ class CalibrationModeDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("选择校准方式")
-        self.setModal(True)
+        self.setModal(False)
         self.setStyleSheet(
             "QDialog{background:#f4f6f5;color:#17221e;}"
             "QLabel{color:#17221e;}"
@@ -896,8 +919,9 @@ class CalibrationModeDialog(QDialog):
     def _choose(self, mode: CalibrationMode) -> None:
         rows = self.grid_rows_spin.value() if mode is CalibrationMode.PRECISE else 3
         columns = self.grid_columns_spin.value() if mode is CalibrationMode.PRECISE else 3
-        self.mode_selected.emit(mode, rows, columns)
+        self.setModal(False)
         self.accept()
+        self.mode_selected.emit(mode, rows, columns)
 
 
 class CaptureWindow(QMainWindow):
@@ -1023,6 +1047,7 @@ class CaptureWindow(QMainWindow):
         grid_rows: int,
         grid_columns: int,
     ) -> None:
+        self._release_mode_dialog()
         self._calibration_mode = True
         self._grid_rows = int(grid_rows)
         self._grid_columns = int(grid_columns)
@@ -1036,8 +1061,18 @@ class CaptureWindow(QMainWindow):
         )
 
     def _cancel_mode_choice(self) -> None:
+        self._release_mode_dialog()
         self._calibration_mode = False
         self._controls.show()
+
+    def _release_mode_dialog(self) -> None:
+        dialog = self.mode_dialog
+        if dialog is None:
+            return
+        dialog.setModal(False)
+        dialog.hide()
+        dialog.deleteLater()
+        self.mode_dialog = None
 
     def show_calibration_point(self, point_id: str) -> None:
         self._calibration_mode = True
@@ -1106,6 +1141,7 @@ class CaptureWindow(QMainWindow):
         self.connect_button.setText("重新连接" if ready else "连接摄像头")
 
     def _on_calibration_finished(self, passed: bool, message: str, failed_targets) -> None:
+        self._release_mode_dialog()
         self.result_label.setText(message)
         self._calibration_mode = False
         self._controls.show()

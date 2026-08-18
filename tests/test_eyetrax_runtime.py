@@ -207,6 +207,8 @@ def test_reference_feature_range_softens_quality_then_hard_rejects():
     assert soft.quality == pytest.approx(0.5)
     assert not hard.valid
     assert hard.quality == 0.0
+    assert (hard.raw_x, hard.raw_y) == (100.0, 200.0)
+    assert hard.screen_x is None
 
 
 def test_smoother_resets_after_reference_invalid_interval():

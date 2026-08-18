@@ -366,6 +366,39 @@ def test_prediction_stage_extends_a_short_window_for_low_camera_fps(tmp_path: Pa
     controller.stop()
 
 
+def test_prediction_stage_uses_raw_prediction_rejected_for_live_output(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda camera_index: CalibrationEnvironment(
+            1920, 1080, 1.0, camera_index, "gaze-grid-v1"
+        ),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    controller._calibration_active = True
+    controller._start_prediction_stage("bias", ("target_4",))
+
+    controller._process_prediction_stage(
+        CapturePacket(
+            0.0,
+            FrameObservation(np.ones(2), True, False),
+            GazeEstimate(False, True, False, 0.0, 400.0, 900.0),
+            20.0,
+        )
+    )
+    controller._process_prediction_stage(
+        CapturePacket(
+            0.3,
+            FrameObservation(np.ones(2), True, False),
+            GazeEstimate(False, True, False, 0.0, 410.0, 910.0),
+            20.0,
+        )
+    )
+
+    assert controller._prediction_samples == [(410.0, 910.0)]
+    controller.stop()
+
+
 def test_loaded_calibration_starts_output_when_camera_becomes_ready(tmp_path: Path):
     controller = CaptureController(
         AppPaths.for_root(tmp_path),
@@ -411,6 +444,8 @@ def test_calibration_button_opens_fullscreen_mode_menu_with_estimates(qtbot, tmp
 
     assert window.mode_dialog is not None
     assert window.mode_dialog.isFullScreen()
+    assert not window.mode_dialog.isModal()
+    assert window.isEnabled()
     assert "25–35 秒" in window.mode_dialog.fast_button.text()
     assert "50–60 秒" in window.mode_dialog.precise_button.text()
     assert window.mode_dialog.grid_rows_spin.value() == 3
@@ -432,6 +467,23 @@ def test_mode_menu_starts_selected_calibration_with_validation_choice(qtbot, tmp
     assert controller.calibration_calls == [(CalibrationMode.PRECISE, True, 4, 5)]
     assert window._calibration_mode
     assert not window._controls.isVisible()
+
+
+def test_mode_dialog_closes_before_fullscreen_calibration_starts(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+    window._begin_calibration()
+    dialog = window.mode_dialog
+    visible_when_selected = []
+    dialog.mode_selected.connect(
+        lambda *_args: visible_when_selected.append(dialog.isVisible())
+    )
+
+    qtbot.mouseClick(dialog.fast_button, Qt.MouseButton.LeftButton)
+
+    assert visible_when_selected == [False]
 
 
 def test_precise_calibration_uses_selected_initial_grid(tmp_path: Path):

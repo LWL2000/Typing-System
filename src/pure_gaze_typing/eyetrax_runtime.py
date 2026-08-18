@@ -168,7 +168,12 @@ class EyeTraxRuntime:
 
         self._mark_valid()
         quality, hard_reject = self._quality_and_range(observation.features)
-        if hard_reject:
+        model = getattr(self._estimator, "model", None)
+        scaler = getattr(model, "scaler", None)
+        range_guard_enabled = (
+            self.metadata.feature_range_threshold is not None and scaler is not None
+        )
+        if hard_reject and not range_guard_enabled:
             return GazeEstimate(False, True, False, quality)
         prediction = np.asarray(
             self._estimator.predict(observation.features.reshape(1, -1)),
@@ -177,6 +182,8 @@ class EyeTraxRuntime:
         raw_x, raw_y = map(float, prediction)
         if not np.isfinite(raw_x) or not np.isfinite(raw_y):
             return GazeEstimate(False, True, False, quality)
+        if hard_reject:
+            return GazeEstimate(False, True, False, quality, raw_x, raw_y)
         corrected_x, corrected_y = raw_x, raw_y
         if self.metadata.screen_affine:
             corrected_x, corrected_y = apply_screen_affine(
