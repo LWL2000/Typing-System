@@ -24,6 +24,7 @@ class FakeCaptureController(QObject):
     calibration_finished = pyqtSignal(bool, str, object)
     stream_state_changed = pyqtSignal(bool, str)
     preview_ready = pyqtSignal(object)
+    shutdown_finished = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -33,6 +34,7 @@ class FakeCaptureController(QObject):
         self.camera_calls = []
         self.stop_stream_calls = 0
         self.start_stream_calls = 0
+        self.retry_failed_calls = 0
 
     def start_camera(self, index):
         self.camera_calls.append(index)
@@ -50,13 +52,16 @@ class FakeCaptureController(QObject):
         self.stop_stream_calls += 1
 
     def retry_failed_regions(self):
-        return None
+        self.retry_failed_calls += 1
 
     def save_anyway(self):
         return None
 
     def stop(self):
         self.stop_calls += 1
+
+    def finish_shutdown(self):
+        self.shutdown_finished.emit()
 
 
 class FakePublisher:
@@ -212,7 +217,8 @@ def test_slow_runtime_initialization_does_not_block_the_ui_thread(qtbot, monkeyp
 
     assert elapsed < 0.15
     qtbot.waitUntil(lambda: any(ready for ready, _message in states), timeout=1000)
-    controller.stop()
+    with qtbot.waitSignal(controller.shutdown_finished, timeout=2000):
+        controller.stop()
 
 
 def test_camera_worker_emits_preview_at_ten_fps_while_preserving_gaze_packets(monkeypatch):
@@ -301,7 +307,7 @@ def test_reconnect_responds_before_camera_initialization(qtbot, tmp_path: Path):
     qtbot.waitUntil(lambda: controller.camera_calls == [0], timeout=300)
 
 
-def test_window_close_stops_controller_and_closes_immediately(qtbot, tmp_path: Path):
+def test_window_close_hides_immediately_and_finishes_after_async_shutdown(qtbot, tmp_path: Path):
     controller = FakeCaptureController()
     window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
     qtbot.addWidget(window)
@@ -311,6 +317,11 @@ def test_window_close_stops_controller_and_closes_immediately(qtbot, tmp_path: P
 
     assert controller.stop_calls == 1
     assert not window.isVisible()
+    assert window._closing
+
+    controller.finish_shutdown()
+
+    assert window._shutdown_complete
 
 
 def test_prediction_summary_rejects_outlier_and_requires_eight_samples():
@@ -322,6 +333,37 @@ def test_prediction_summary_rejects_outlier_and_requires_eight_samples():
     assert prediction == pytest.approx((504.5, 295.5), abs=1.0)
     with pytest.raises(RuntimeError, match="at least 8"):
         stable_median_prediction(samples[:7], min_samples=8, max_samples=20)
+
+
+def test_prediction_stage_extends_a_short_window_for_low_camera_fps(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda camera_index: CalibrationEnvironment(
+            1920, 1080, 1.0, camera_index, "gaze-grid-v1"
+        ),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    controller._calibration_active = True
+    controller._start_prediction_stage("bias", ("target_7",))
+    outcomes = []
+    controller.calibration_finished.connect(
+        lambda passed, message, failed: outcomes.append((passed, message, failed))
+    )
+
+    for timestamp in (0.0, 0.25, 0.35, 0.45, 0.55, 0.70):
+        controller._process_prediction_stage(
+            CapturePacket(
+                timestamp,
+                FrameObservation(np.ones(2), True, False),
+                GazeEstimate(True, True, False, 1.0, 10.0, 20.0, 10.0, 20.0),
+                10.0,
+            )
+        )
+
+    assert outcomes == []
+    assert controller._prediction_stage == "bias"
+    controller.stop()
 
 
 def test_loaded_calibration_starts_output_when_camera_becomes_ready(tmp_path: Path):
@@ -451,6 +493,19 @@ def test_failed_validation_exposes_retry_and_save_actions(qtbot, tmp_path: Path)
     controller.calibration_finished.emit(False, "命中 4/6", ("target_1", "target_4"))
     assert window.retry_failed_button.isVisibleTo(window)
     assert not window.save_anyway_button.isVisibleTo(window)
+
+
+def test_retry_failed_regions_responds_to_a_real_mouse_click(qtbot, tmp_path: Path):
+    controller = FakeCaptureController()
+    window = CaptureWindow(controller, AppPaths.for_root(tmp_path))
+    qtbot.addWidget(window)
+    window.show()
+    controller.calibration_finished.emit(False, "target_7 有效注视样本不足", ("target_7",))
+
+    qtbot.mouseClick(window.retry_failed_button, Qt.MouseButton.LeftButton)
+
+    assert controller.retry_failed_calls == 1
+    assert "正在重校" in window.result_label.text()
 
 
 def test_worker_training_remains_provisional_until_explicit_promotion(tmp_path: Path):
@@ -604,7 +659,9 @@ def test_runtime_initialization_failure_is_reported_without_escaping(qtbot, tmp_
 
     qtbot.waitUntil(lambda: bool(states), timeout=1000)
     assert states == [(False, "眼动运行时初始化失败：模型无法加载")]
-    controller.stop()
+    if not controller._shutdown_emitted:
+        with qtbot.waitSignal(controller.shutdown_finished, timeout=2000):
+            controller.stop()
 
 
 def test_stop_disables_heartbeat_before_closing_resources(qtbot, tmp_path: Path):
@@ -623,7 +680,7 @@ def test_stop_disables_heartbeat_before_closing_resources(qtbot, tmp_path: Path)
     assert not controller._heartbeat.isActive()
 
 
-def test_stop_camera_uses_bounded_wait_and_force_fallback(monkeypatch, tmp_path: Path):
+def test_stop_camera_never_waits_on_the_ui_thread(monkeypatch, tmp_path: Path):
     controller = CaptureController(
         AppPaths.for_root(tmp_path),
         lambda camera_index: CalibrationEnvironment(
@@ -634,20 +691,18 @@ def test_stop_camera_uses_bounded_wait_and_force_fallback(monkeypatch, tmp_path:
     )
     events = []
 
-    class FakeRuntime:
-        def close(self):
-            events.append("runtime_close")
-
     class FakeWorker:
-        stopped = False
-
         def request_stop(self):
             events.append("worker_request_stop")
 
     worker = FakeWorker()
-    runtime = FakeRuntime()
 
-    class FakeThread:
+    class FakeThread(QObject):
+        finished = pyqtSignal()
+
+        def __init__(self):
+            super().__init__()
+
         def isRunning(self):
             return True
 
@@ -656,7 +711,7 @@ def test_stop_camera_uses_bounded_wait_and_force_fallback(monkeypatch, tmp_path:
 
         def wait(self, timeout):
             events.append(("thread_wait", timeout))
-            return False
+            raise AssertionError("UI thread must never wait for the camera thread")
 
         def requestInterruption(self):
             events.append("thread_interrupt")
@@ -675,16 +730,45 @@ def test_stop_camera_uses_bounded_wait_and_force_fallback(monkeypatch, tmp_path:
 
     monkeypatch.setattr(capture_module, "QMetaObject", FakeMetaObject, raising=False)
     controller.worker = worker
-    controller.thread = FakeThread()
-    controller.runtime = runtime
+    thread = FakeThread()
+    controller.thread = thread
 
     controller.stop_camera()
 
     assert events[0][0] == "worker_stop"
-    assert all(event != ("thread_wait", None) for event in events)
-    assert ("thread_wait", 2500) in events
-    assert ("thread_wait", 1000) in events
-    assert "thread_terminate" in events
+    assert not any(isinstance(event, tuple) and event[0] == "thread_wait" for event in events)
+    assert controller.worker is worker
+    assert controller.thread is thread
+
+
+def test_camera_packets_are_coalesced_before_the_ui_processes_them(tmp_path: Path):
+    controller = CaptureController(
+        AppPaths.for_root(tmp_path),
+        lambda camera_index: CalibrationEnvironment(
+            1920, 1080, 1.0, camera_index, "gaze-grid-v1"
+        ),
+        tmp_path / "face_landmarker.task",
+        publisher_factory=FakePublisher,
+    )
+    packets = [
+        CapturePacket(
+            float(index),
+            FrameObservation(np.ones(2), True, False),
+            GazeEstimate(True, True, False, 1.0, 10.0, 20.0, 10.0, 20.0),
+            30.0,
+        )
+        for index in range(100)
+    ]
+    processed = []
+    controller._on_packet = processed.append
+
+    for packet in packets:
+        controller._queue_latest_packet(packet)
+
+    assert processed == []
+    controller._drain_latest_packet()
+    assert processed == [packets[-1]]
+    controller.stop()
 
 
 def test_sustained_leave_then_return_starts_five_point_reentry_calibration(tmp_path: Path):

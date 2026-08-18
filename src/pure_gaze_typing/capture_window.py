@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import logging
+import threading
 import time
 import uuid
 
@@ -58,11 +59,15 @@ LOGGER = logging.getLogger("pure_gaze_typing.capture")
 
 
 class CaptureController(QObject):
+    MIN_PREDICTION_SAMPLES = 8
+    MAX_PREDICTION_CAPTURE_SECONDS = 1.20
+
     camera_state_changed = pyqtSignal(bool, str)
     calibration_point_changed = pyqtSignal(str)
     calibration_finished = pyqtSignal(bool, str, object)
     stream_state_changed = pyqtSignal(bool, str)
     preview_ready = pyqtSignal(object)
+    shutdown_finished = pyqtSignal()
     _train_requested = pyqtSignal(object, object, object)
     _configure_requested = pyqtSignal(object)
     _save_requested = pyqtSignal(object)
@@ -116,14 +121,40 @@ class CaptureController(QObject):
         self._reentry_pending = False
         self._reentry_predictions: dict[str, tuple[float, float]] = {}
         self._saving_reason = "full"
+        self._pending_camera_index: int | None = None
+        self._camera_stop_requested = False
+        self._shutdown_requested = False
+        self._shutdown_emitted = False
+        self._publisher_closed = False
+        self._packet_lock = threading.Lock()
+        self._pending_packet: CapturePacket | None = None
+        self._packet_timer = QTimer(self)
+        self._packet_timer.setInterval(25)
+        self._packet_timer.timeout.connect(self._drain_latest_packet)
+        self._packet_timer.start()
+        self._stop_watchdog = QTimer(self)
+        self._stop_watchdog.setSingleShot(True)
+        self._stop_watchdog.setInterval(3000)
+        self._stop_watchdog.timeout.connect(self._force_camera_thread_stop)
         self._heartbeat = QTimer(self)
         self._heartbeat.setInterval(1000)
         self._heartbeat.timeout.connect(self._publish_heartbeat)
         self._heartbeat.start()
 
     def start_camera(self, camera_index: int) -> None:
+        camera_index = int(camera_index)
         LOGGER.info("camera_start_requested index=%s", camera_index)
-        self.stop_camera()
+        if self._shutdown_requested:
+            LOGGER.warning("camera_start_rejected shutdown_in_progress=True")
+            return
+        if self.thread is not None:
+            self._pending_camera_index = camera_index
+            self.camera_state_changed.emit(False, "正在重新连接摄像头…")
+            self._request_camera_stop()
+            return
+        self._launch_camera(camera_index)
+
+    def _launch_camera(self, camera_index: int) -> None:
         self.environment = self.environment_factory(int(camera_index))
         LOGGER.info("camera_environment_ready environment=%s", self.environment)
         stored = self.store.load(self.environment)
@@ -146,7 +177,10 @@ class CaptureController(QObject):
         self.worker.runtime_ready.connect(self._on_runtime_ready)
         self.worker.camera_opened.connect(self._on_camera_state)
         self.worker.preview_ready.connect(self.preview_ready)
-        self.worker.packet_ready.connect(self._on_packet)
+        self.worker.packet_ready.connect(
+            self._queue_latest_packet,
+            Qt.ConnectionType.DirectConnection,
+        )
         self.worker.model_trained.connect(self._on_model_trained)
         self.worker.model_configured.connect(self._on_model_configured)
         self.worker.model_saved.connect(self._on_model_saved)
@@ -156,6 +190,8 @@ class CaptureController(QObject):
             self.thread.quit,
             Qt.ConnectionType.DirectConnection,
         )
+        self.thread.finished.connect(self._on_camera_thread_finished)
+        self.thread.finished.connect(self.thread.deleteLater)
         self._train_requested.connect(self.worker.train_model)
         self._configure_requested.connect(self.worker.configure_metadata)
         self._save_requested.connect(self.worker.save_current)
@@ -284,46 +320,98 @@ class CaptureController(QObject):
         LOGGER.info("stream_stopped")
         self.stream_state_changed.emit(False, "眼动输出已暂停（摄像头预览继续）")
 
+    def _queue_latest_packet(self, packet: CapturePacket) -> None:
+        with self._packet_lock:
+            self._pending_packet = packet
+
+    def _drain_latest_packet(self) -> None:
+        with self._packet_lock:
+            packet = self._pending_packet
+            self._pending_packet = None
+        if packet is not None:
+            self._on_packet(packet)
+
     def stop_camera(self) -> None:
-        forced = False
-        if self.worker is not None and self.thread is not None:
-            if self.thread.isRunning():
-                LOGGER.info("camera_worker_stop_requested")
-                QMetaObject.invokeMethod(
-                    self.worker,
-                    "stop",
-                    Qt.ConnectionType.QueuedConnection,
-                )
-                if not self.thread.wait(2500):
-                    forced = True
-                    LOGGER.warning("camera_thread_stop_timeout")
-                    self.worker.request_stop()
-                    self.thread.requestInterruption()
-                    self.thread.quit()
-                    if not self.thread.wait(1000):
-                        LOGGER.error("camera_thread_force_terminate")
-                        self.thread.terminate()
-                        self.thread.wait(1000)
-            LOGGER.info("camera_thread_stopped")
-        if self.runtime is not None and (self.thread is None or forced):
-            try:
-                self.runtime.close()
-            except Exception:
-                LOGGER.exception("camera_runtime_close_failed")
-            LOGGER.info("camera_runtime_closed")
-        self.worker = None
-        self.thread = None
-        self.runtime = None
+        self._pending_camera_index = None
+        self._request_camera_stop()
+
+    def _request_camera_stop(self) -> None:
+        if self.worker is None or self.thread is None:
+            if self._shutdown_requested:
+                self._finish_shutdown()
+            return
+        if self._camera_stop_requested:
+            return
+        self._camera_stop_requested = True
         self._camera_ready = False
         self._streaming = False
         self._reentry_pending = False
         self._presence.reset()
+        with self._packet_lock:
+            self._pending_packet = None
+        LOGGER.info("camera_worker_stop_requested async=True")
+        try:
+            QMetaObject.invokeMethod(
+                self.worker,
+                "stop",
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self.worker.request_stop()
+        except RuntimeError:
+            LOGGER.info("camera_worker_already_deleted")
+        self.thread.requestInterruption()
+        self._stop_watchdog.start()
+
+    def _force_camera_thread_stop(self) -> None:
+        thread = self.thread
+        if thread is None or not thread.isRunning():
+            return
+        LOGGER.error("camera_thread_force_terminate async=True")
+        if self.worker is not None:
+            self.worker.request_stop()
+        thread.requestInterruption()
+        thread.quit()
+        thread.terminate()
+
+    def _on_camera_thread_finished(self) -> None:
+        self._stop_watchdog.stop()
+        LOGGER.info("camera_thread_stopped")
+        self.worker = None
+        self.thread = None
+        self.runtime = None
+        self._camera_stop_requested = False
+        with self._packet_lock:
+            self._pending_packet = None
+        if self._shutdown_requested:
+            self._finish_shutdown()
+            return
+        pending_camera_index = self._pending_camera_index
+        self._pending_camera_index = None
+        if pending_camera_index is not None:
+            QTimer.singleShot(0, lambda: self.start_camera(pending_camera_index))
 
     def stop(self) -> None:
+        if self._shutdown_requested:
+            return
+        LOGGER.info("capture_shutdown_requested")
+        self._shutdown_requested = True
+        self._pending_camera_index = None
         self._heartbeat.stop()
+        self._packet_timer.stop()
         self.stop_streaming()
-        self.stop_camera()
-        self.publisher.close()
+        self._request_camera_stop()
+        if self.thread is None:
+            self._finish_shutdown()
+
+    def _finish_shutdown(self) -> None:
+        if self._shutdown_emitted:
+            return
+        if not self._publisher_closed:
+            self.publisher.close()
+            self._publisher_closed = True
+        self._shutdown_emitted = True
+        LOGGER.info("capture_shutdown_finished")
+        self.shutdown_finished.emit()
 
     def _on_camera_state(self, ready: bool, message: str) -> None:
         self._camera_ready = ready
@@ -475,13 +563,24 @@ class CaptureController(QObject):
             self._prediction_samples.append((estimate.raw_x, estimate.raw_y))
         if elapsed < settle + capture:
             return
-        if len(self._prediction_samples) < 8:
+        if (
+            len(self._prediction_samples) < self.MIN_PREDICTION_SAMPLES
+            and elapsed < settle + self.MAX_PREDICTION_CAPTURE_SECONDS
+        ):
+            return
+        if len(self._prediction_samples) < self.MIN_PREDICTION_SAMPLES:
             target_id = self._prediction_target_ids[self._prediction_index]
             if self._prediction_stage == "reentry":
                 self._prediction_started_at = None
                 self._prediction_samples = []
                 self.calibration_point_changed.emit(target_id)
                 return
+            LOGGER.warning(
+                "prediction_samples_insufficient target=%s samples=%s fps=%.1f",
+                target_id,
+                len(self._prediction_samples),
+                packet.fps,
+            )
             self._prediction_stage = None
             self._calibration_active = False
             self.calibration_finished.emit(False, f"{target_id} 有效注视样本不足，请重试", (target_id,))
@@ -490,7 +589,7 @@ class CaptureController(QObject):
         target_id = self._prediction_target_ids[self._prediction_index]
         median_prediction = stable_median_prediction(
             self._prediction_samples,
-            min_samples=8,
+            min_samples=self.MIN_PREDICTION_SAMPLES,
             max_samples=20,
         )
         if self._prediction_stage == "bias":
@@ -811,6 +910,7 @@ class CaptureWindow(QMainWindow):
         self.mode_dialog: CalibrationModeDialog | None = None
         self._last_preview_at = 0.0
         self._closing = False
+        self._shutdown_complete = False
         self._grid_rows = 3
         self._grid_columns = 3
         self.setWindowTitle("眼动采集校准")
@@ -873,17 +973,19 @@ class CaptureWindow(QMainWindow):
         self.calibrate_button.clicked.connect(self._begin_calibration)
         self.stream_button.pressed.connect(self._request_stream_start)
         self.stop_stream_button.pressed.connect(self._request_stream_stop)
-        self.retry_failed_button.clicked.connect(self.controller.retry_failed_regions)
+        self.retry_failed_button.clicked.connect(self._request_retry_failed_regions)
         self.save_anyway_button.clicked.connect(self.controller.save_anyway)
         controller.camera_state_changed.connect(self._on_camera_state)
         controller.calibration_point_changed.connect(self.show_calibration_point)
         controller.calibration_finished.connect(self._on_calibration_finished)
         controller.stream_state_changed.connect(self._on_stream_state)
         controller.preview_ready.connect(self._on_preview)
+        controller.shutdown_finished.connect(self._finish_close)
 
     def _request_camera_connection(self) -> None:
         reconnecting = self.connect_button.text() == "重新连接"
         action = "重新连接" if reconnecting else "连接"
+        LOGGER.info("ui_action camera_%s", "reconnect" if reconnecting else "connect")
         self.camera_status_label.setText(f"正在{action}摄像头…")
         self.result_label.setText(f"正在{action}摄像头，请稍候")
         self.connect_button.setEnabled(False)
@@ -891,14 +993,17 @@ class CaptureWindow(QMainWindow):
         QTimer.singleShot(50, lambda: self.controller.start_camera(camera_index))
 
     def _request_stream_start(self) -> None:
+        LOGGER.info("ui_action stream_resume")
         self.result_label.setText("正在恢复眼动输出…")
         self.controller.start_streaming()
 
     def _request_stream_stop(self) -> None:
+        LOGGER.info("ui_action stream_pause")
         self.result_label.setText("正在暂停眼动输出…")
         self.controller.stop_streaming()
 
     def _begin_calibration(self) -> None:
+        LOGGER.info("ui_action calibration_open")
         self.result_label.setText("请选择校准方式")
         self.mode_dialog = CalibrationModeDialog(self)
         self.mode_dialog.mode_selected.connect(self._start_selected_calibration)
@@ -906,6 +1011,11 @@ class CaptureWindow(QMainWindow):
         self.mode_dialog.showFullScreen()
         self.mode_dialog.raise_()
         self.mode_dialog.activateWindow()
+
+    def _request_retry_failed_regions(self) -> None:
+        LOGGER.info("ui_action calibration_retry_failed_regions")
+        self.result_label.setText("正在重校异常区域…")
+        self.controller.retry_failed_regions()
 
     def _start_selected_calibration(
         self,
@@ -1034,11 +1144,22 @@ class CaptureWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._closing:
+        if self._shutdown_complete:
             event.accept()
             return
+        event.ignore()
+        if self._closing:
+            return
+        LOGGER.info("ui_action window_close")
         self._closing = True
         if self.mode_dialog is not None:
             self.mode_dialog.close()
+        self.hide()
         self.controller.stop()
-        event.accept()
+
+    def _finish_close(self) -> None:
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        LOGGER.info("ui_window_close_finished")
+        QTimer.singleShot(0, self.close)

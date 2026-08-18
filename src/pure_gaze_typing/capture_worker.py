@@ -209,14 +209,8 @@ class CameraWorker(QObject):
         self._finish_stop()
 
     def request_stop(self) -> None:
-        """Thread-safe fallback used when the worker event loop is busy."""
+        """Thread-safe stop flag; resource cleanup remains on the worker thread."""
         self._stop_requested.set()
-        capture = self._capture
-        if capture is not None:
-            try:
-                capture.release()
-            except Exception:
-                LOGGER.exception("camera_capture_release_failed")
 
     def _finish_stop(self) -> None:
         if self._stopped:

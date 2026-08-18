@@ -87,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
 
     controller = CaptureController(paths, environment_factory, find_face_model())
     window = CaptureWindow(controller, paths)
+    controller.shutdown_finished.connect(app.quit)
     window.show()
     return app.exec()
 
